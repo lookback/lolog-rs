@@ -178,6 +178,18 @@ impl LogBuilder {
         }
         self
     }
+    /// Set the session id this belongs to.
+    pub fn session_id(mut self, session_id: &str) -> LogBuilder {
+        self.with_wk().sessionId.replace(session_id.to_string());
+        self
+    }
+    /// Set the session id, if it is there.
+    pub fn maybe_session_id(mut self, session_id: &Option<String>) -> LogBuilder {
+        if let Some(session_id) = session_id {
+            self.with_wk().sessionId.replace(session_id.clone());
+        }
+        self
+    }
     /// Provide the user ip address.
     pub fn user_ip(mut self, user_ip: &str) -> LogBuilder {
         self.with_wk().userIp.replace(user_ip.to_string());
@@ -191,6 +203,21 @@ impl LogBuilder {
     /// Consume and send this log row.
     pub fn send(self) {
         do_log(self);
+    }
+    pub fn well_knownable(mut self, wk: &WellKnownable) -> LogBuilder {
+        if let Some(recording_id) = wk.recording_id() {
+            self.with_wk().recordingId.replace(recording_id);
+        }
+        if let Some(user_id) = wk.user_id() {
+            self.with_wk().userId.replace(user_id);
+        }
+        if let Some(user_ip) = wk.user_ip() {
+            self.with_wk().userIp.replace(user_ip);
+        }
+        if let Some(session_id) = wk.session_id() {
+            self.with_wk().sessionId.replace(session_id);
+        }
+        self
     }
     fn with_wk(&mut self) -> &mut WellKnown {
         self.well_known.get_or_insert_with(|| WellKnown {
@@ -230,6 +257,21 @@ impl LogBuilder {
     }
 }
 
+pub trait WellKnownable {
+    fn recording_id(&self) -> Option<String> {
+        None
+    }
+    fn user_id(&self) -> Option<String> {
+        None
+    }
+    fn user_ip(&self) -> Option<String> {
+        None
+    }
+    fn session_id(&self) -> Option<String> {
+        None
+    }
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Default)]
 #[allow(non_snake_case)]
 struct WellKnown {
@@ -239,6 +281,8 @@ struct WellKnown {
     userId: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     userIp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessionId: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<&'static str>,
 }
