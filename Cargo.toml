@@ -1,5 +1,5 @@
 [package]
-name = "lolog-rs"
+name = "lolog"
 version = "0.1.0"
 authors = ["Martin Algesten <martin@algesten.se>"]
 edition = "2018"
