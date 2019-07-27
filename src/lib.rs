@@ -555,7 +555,7 @@ impl std::error::Error for LologError {
 #[macro_export]
 macro_rules! xtrace {
     ($($arg:tt)*) => (
-        $crate::lolog::log($crate::lolog::Level::Trace, &format!($($arg)*));
+        ::lolog_rs::log(::lolog_rs::Level::Trace, &format!($($arg)*));
     )
 }
 
@@ -563,7 +563,7 @@ macro_rules! xtrace {
 #[macro_export]
 macro_rules! xdebug {
     ($($arg:tt)*) => (
-        $crate::lolog::log($crate::lolog::Level::Debug, &format!($($arg)*));
+        ::lolog_rs::log(::lolog_rs::Level::Debug, &format!($($arg)*));
     )
 }
 
@@ -571,7 +571,7 @@ macro_rules! xdebug {
 #[macro_export]
 macro_rules! xinfo {
     ($($arg:tt)*) => (
-        $crate::lolog::log($crate::lolog::Level::Info, &format!($($arg)*));
+        ::lolog_rs::log(::lolog_rs::Level::Info, &format!($($arg)*));
     )
 }
 
@@ -579,7 +579,7 @@ macro_rules! xinfo {
 #[macro_export]
 macro_rules! xwarn {
     ($($arg:tt)*) => (
-        $crate::lolog::log($crate::lolog::Level::Warn, &format!($($arg)*));
+        ::lolog_rs::log(::lolog_rs::Level::Warn, &format!($($arg)*));
     )
 }
 
@@ -587,7 +587,7 @@ macro_rules! xwarn {
 #[macro_export]
 macro_rules! xerror {
     ($($arg:tt)*) => (
-        $crate::lolog::log($crate::lolog::Level::Error, &format!($($arg)*));
+        ::lolog_rs::log(::lolog_rs::Level::Error, &format!($($arg)*));
     )
 }
 
