@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use uuid::Uuid;
 
+pub use ::log::{trace, debug, info, warn, error};
 pub use ::log::Level;
 
 lazy_static! {
