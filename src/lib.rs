@@ -17,15 +17,25 @@ lazy_static! {
     };
 }
 
+/// Lolog configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogConf {
+    /// Minimum visible log level. Defaults to INFO.
     pub min_level: Level,
+    /// Hostname of syslog entries from this instance. Default is OS hostname.
     pub hostname: String,
+    /// Env of syslog entries. Default is the ENV variable, and otherwise "development".
     pub env: String,
+    /// Name of application. This is the default `namespace` in log messages. Can be appended
+    /// to, compare `ios` vs `ios.bcast`. It is also used as `api_key_name`.
     pub app_name: String,
+    /// Application version string.
     pub app_version: String,
+    /// API key for loggin to our syslog server.
     pub api_key: String,
+    /// Name of host to connect and deliver log messages to.
     pub log_host: String,
+    /// Port on host to deliver log messages to.
     pub log_port: u16,
 }
 
@@ -45,29 +55,19 @@ impl std::default::Default for LogConf {
 }
 
 impl LogConf {
+    /// Create a new LogConf. Also consider using `Default::default()`.
     pub fn new() -> Self {
         LogConf {
             ..Default::default()
         }
     }
-    pub fn use_syslog(&self) -> bool {
+    fn use_syslog(&self) -> bool {
         !self.api_key.is_empty()
     }
 }
 
-// lazy_static! {
-//     static ref LOG_MIN_LEVEL: Level = {
-//         level_from_str(
-//             std::env::var("LOG_MIN_LEVEL")
-//                 .unwrap_or_else(|_| "Info".to_string())
-//                 .as_str(),
-//         )
-//     };
-//     static ref LOG_USE_SYSLOG: bool = { std::env::var("SYSLOG_API_KEY").is_ok() };
-//     static ref SYSLOG_API_KEY: String =
-//         { std::env::var("SYSLOG_API_KEY").unwrap_or_else(|_| "".to_string()) };
-// }
-
+/// Start logging a simple message to the logger. The returned builder must be called
+/// `.send()` upon to actually send the message.
 pub fn log(level: Level, message: &str) -> LogBuilder {
     LogBuilder {
         level,
@@ -76,11 +76,13 @@ pub fn log(level: Level, message: &str) -> LogBuilder {
     }
 }
 
+/// Check if the given log level is enabled.
 pub fn log_level_enabled(level: Level) -> bool {
     let conf = LOG_CONF.lock().unwrap();
     conf.min_level.as_u8() >= level.as_u8()
 }
 
+/// Log builders allows more fine grained details to be sent to the logging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogBuilder {
     conf: LogConf,
@@ -135,47 +137,57 @@ impl std::default::Default for LogBuilder {
 }
 
 impl LogBuilder {
+    /// Add an explicit timestamp to this message.
     pub fn timestamp(mut self, timestamp: SystemTime) -> LogBuilder {
         self.timestamp = timestamp;
         self
     }
+    /// Make a subsystem name under the application name. I.e. `ios` vs `ios.bcast`.
     pub fn subname(mut self, subname: &str) -> LogBuilder {
         self.namespace = format!("{}.{}", self.namespace, subname);
         self
     }
+    /// Provide some JSON serializable data to be included in the message.
     pub fn data<T: Serialize>(mut self, data: &T) -> LogBuilder {
         let data = serde_json::to_string(data).expect("Failed to serialize json");
         self.actual_data.replace(data);
         self.with_wk().data.replace("***DATA_GOES_HERE***");
         self
     }
-    pub fn data_s(mut self, data: &str) -> LogBuilder {
+    /// Provide some JSON serializable data as a str.
+    pub fn data_str(mut self, data: &str) -> LogBuilder {
         self.actual_data.replace(data.to_string());
         self.with_wk().data.replace("***DATA_GOES_HERE***");
         self
     }
+    /// Set recording id this log message belongs to.
     pub fn recording_id(mut self, recording_id: &str) -> LogBuilder {
         self.with_wk().recordingId.replace(recording_id.to_string());
         self
     }
+    /// Set user id this log message belongs to.
     pub fn user_id(mut self, user_id: &str) -> LogBuilder {
         self.with_wk().userId.replace(user_id.to_string());
         self
     }
+    /// Set the user id, if it is there.
     pub fn maybe_user_id(mut self, user_id: &Option<String>) -> LogBuilder {
         if let Some(user_id) = user_id {
             self.with_wk().userId.replace(user_id.clone());
         }
         self
     }
+    /// Provide the user ip address.
     pub fn user_ip(mut self, user_ip: &str) -> LogBuilder {
         self.with_wk().userIp.replace(user_ip.to_string());
         self
     }
+    /// Suppress the use of a uuid as msg id, if need be. Default is on.
     pub fn use_uuid(mut self, use_uuid: bool) -> LogBuilder {
         self.use_uuid = use_uuid;
         self
     }
+    /// Consume and send this log row.
     pub fn send(self) {
         do_log(self);
     }
@@ -266,6 +278,8 @@ impl LevelExt for Level {
     }
 }
 
+/// Parse a level string such as "info" or "Info" or "INFO" to corresponding level.
+/// Handles `trace`, `debug`, `info`, `warn`, and `error`.
 pub fn level_from_str(s: &str) -> Level {
     match s.to_lowercase().as_str() {
         "trace" => Level::Trace,
@@ -500,6 +514,7 @@ use ::log::LevelFilter;
 
 static LOGGER: SimpleLogger = SimpleLogger;
 
+/// Configure the logger by providing the conf for it.
 pub fn setup_logger(conf: LogConf) {
     let mut lock = LOG_CONF.lock().unwrap();
     *lock = conf;
@@ -512,7 +527,7 @@ pub fn setup_logger(conf: LogConf) {
 }
 
 #[derive(Debug, Clone)]
-pub struct LologError {
+struct LologError {
     code: u16,
     message: String,
 }
@@ -535,6 +550,7 @@ impl std::fmt::Display for LologError {
 impl std::error::Error for LologError {
 }
 
+/// Create a log builder for the TRACE level.
 #[macro_export]
 macro_rules! xtrace {
     ($($arg:tt)*) => (
@@ -542,6 +558,7 @@ macro_rules! xtrace {
     )
 }
 
+/// Create a log builder for the DEBUG level.
 #[macro_export]
 macro_rules! xdebug {
     ($($arg:tt)*) => (
@@ -549,6 +566,7 @@ macro_rules! xdebug {
     )
 }
 
+/// Create a log builder for the INFO level.
 #[macro_export]
 macro_rules! xinfo {
     ($($arg:tt)*) => (
@@ -556,6 +574,7 @@ macro_rules! xinfo {
     )
 }
 
+/// Create a log builder for the WARN level.
 #[macro_export]
 macro_rules! xwarn {
     ($($arg:tt)*) => (
@@ -563,6 +582,7 @@ macro_rules! xwarn {
     )
 }
 
+/// Create a log builder for the ERROR level.
 #[macro_export]
 macro_rules! xerror {
     ($($arg:tt)*) => (
