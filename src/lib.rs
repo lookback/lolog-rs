@@ -371,11 +371,13 @@ fn do_log(l: LogBuilder) {
     if l.conf.min_level.as_u8() < l.level.as_u8() {
         return;
     }
-    if l.level.severity().is_none() {
-        return;
-    }
+    // do print all levels locally.
     if !l.conf.use_syslog() {
         eprintln!("{}", l);
+        return;
+    }
+    // don't send on stuff without severity
+    if l.level.severity().is_none() {
         return;
     }
 
