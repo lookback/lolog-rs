@@ -661,6 +661,8 @@ mod tests {
         let build = log(Level::Info, "Hello world!")
             .timestamp(now)
             .recording_id("abc123")
+            .user_id("martin")
+            .session_id("my session")
             .data(&RandomStuff { stuff: 42 })
             .use_uuid(false);
         let row = format!("{}", build.to_syslog());
@@ -668,7 +670,8 @@ mod tests {
             row,
             "<142>1 2019-03-18T13:12:27.000+00:00 my-host fumar \
                 1.2.3 - [fumar@53595 apiKey=\"secret stuffz\" env=\"development\"] \
-                Hello world! {\"recordingId\":\"abc123\",\"data\":{\"stuff\":42}}\n"
+                Hello world! {\"recordingId\":\"abc123\",\"userId\":\"martin\",\
+                \"sessionId\":\"my session\",\"data\":{\"stuff\":42}}\n"
         );
     }
 }
