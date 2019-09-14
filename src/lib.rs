@@ -3,19 +3,18 @@
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use serde::Serialize;
+use std::env;
 use std::fmt;
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::SystemTime;
 use uuid::Uuid;
 
-pub use ::log::{trace, debug, info, warn, error};
 pub use ::log::Level;
+pub use ::log::{debug, error, info, trace, warn};
 
 lazy_static! {
-    static ref LOG_CONF: Mutex<LogConf> = {
-        Mutex::new(LogConf::new())
-    };
+    static ref LOG_CONF: Mutex<LogConf> = { Mutex::new(LogConf::new()) };
 }
 
 /// Lolog configuration.
@@ -44,13 +43,17 @@ impl std::default::Default for LogConf {
     fn default() -> Self {
         LogConf {
             min_level: Level::Info,
-            hostname: hostname::get_hostname().unwrap_or_else(||"<hostname>".into()),
-            env: std::env::var("ENV").unwrap_or_else(|_| "development".to_string()),
+            hostname: hostname::get_hostname().unwrap_or_else(|| "<hostname>".into()),
+            env: env::var("ENV").unwrap_or_else(|_| "development".to_string()),
             app_name: "<app name>".into(),
             app_version: "<app version>".into(),
             api_key: "".into(),
-            log_host: "logrelay.lookback.io".into(),
-            log_port: 6514,
+            log_host: env::var("SYSLOG_HOST")
+                .unwrap_or_else(|_| "logrelay.lookback.io".to_string()),
+            log_port: env::var("SYSLOG_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6514),
         }
     }
 }
@@ -120,9 +123,7 @@ impl fmt::Display for LogBuilder {
 
 impl std::default::Default for LogBuilder {
     fn default() -> Self {
-        let conf = {
-            LOG_CONF.lock().unwrap().clone()
-        };
+        let conf = { LOG_CONF.lock().unwrap().clone() };
         let namespace = conf.app_name.to_string();
         LogBuilder {
             conf,
@@ -204,7 +205,7 @@ impl LogBuilder {
     pub fn send(self) {
         do_log(self);
     }
-    pub fn well_knownable(mut self, wk: &WellKnownable) -> LogBuilder {
+    pub fn well_knownable(mut self, wk: &dyn WellKnownable) -> LogBuilder {
         if let Some(recording_id) = wk.recording_id() {
             self.with_wk().recordingId.replace(recording_id);
         }
@@ -451,7 +452,10 @@ fn connect_host(hostname: &str, port: u16) -> Result<TcpStream, LologError> {
         .collect();
 
     if ips.is_empty() {
-        return Err(LologError::new(500, &format!("No ip address for {}", hostname)));
+        return Err(LologError::new(
+            500,
+            &format!("No ip address for {}", hostname),
+        ));
     }
 
     // pick first ip, or should we randomize?
@@ -594,8 +598,7 @@ impl std::fmt::Display for LologError {
     }
 }
 
-impl std::error::Error for LologError {
-}
+impl std::error::Error for LologError {}
 
 /// Create a log builder for the TRACE level.
 #[macro_export]
@@ -669,9 +672,9 @@ mod tests {
         assert_eq!(
             row,
             "<142>1 2019-03-18T13:12:27.000+00:00 my-host fumar \
-                1.2.3 - [fumar@53595 apiKey=\"secret stuffz\" env=\"development\"] \
-                Hello world! {\"recordingId\":\"abc123\",\"userId\":\"martin\",\
-                \"sessionId\":\"my session\",\"data\":{\"stuff\":42}}\n"
+             1.2.3 - [fumar@53595 apiKey=\"secret stuffz\" env=\"development\"] \
+             Hello world! {\"recordingId\":\"abc123\",\"userId\":\"martin\",\
+             \"sessionId\":\"my session\",\"data\":{\"stuff\":42}}\n"
         );
     }
 }
