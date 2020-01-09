@@ -243,7 +243,7 @@ impl LogBuilder {
         SyslogMessage {
             facility: SyslogFacility::Local1,
             severity: self.level.severity().expect("Translate severity"),
-            message: format!("{} {}", self.message, self.json_extra(),),
+            message: format!("{} {}", strip_ctrl(&self.message), self.json_extra(),),
             hostname: &self.conf.hostname,
             timestamp: &self.timestamp,
             msg_id: if self.use_uuid {
@@ -258,6 +258,14 @@ impl LogBuilder {
             env: &self.conf.env,
         }
     }
+}
+
+// replace any char < 32 with a space.
+fn strip_ctrl(s: &str) -> String {
+    s.chars().map(|c| match c {
+        '\x00'..='\x1f' => ' ',
+        _ => c,
+    }).collect()
 }
 
 pub trait WellKnownable {
@@ -650,6 +658,11 @@ mod tests {
     #[derive(Serialize, Debug, Clone, PartialEq, Eq, Default)]
     struct RandomStuff {
         stuff: usize,
+    }
+
+    #[test]
+    fn test_strip_ctrl() {
+        assert_eq!(strip_ctrl("foo\nbar"), "foo bar");
     }
 
     #[test]
