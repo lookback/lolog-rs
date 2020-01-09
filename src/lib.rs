@@ -43,7 +43,9 @@ impl std::default::Default for LogConf {
     fn default() -> Self {
         LogConf {
             min_level: Level::Info,
-            hostname: hostname::get_hostname().unwrap_or_else(|| "<hostname>".into()),
+            hostname: hostname::get()
+                .map(|o| o.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "<hostname>".into()),
             env: env::var("ENV").unwrap_or_else(|_| "development".to_string()),
             app_name: "<app name>".into(),
             app_version: "<app version>".into(),
@@ -229,7 +231,7 @@ impl LogBuilder {
         if let Some(wk) = &self.well_known {
             let ws = serde_json::to_string(wk).expect("Failed to serialize json");
             if let Some(d) = &self.actual_data {
-                (&ws).replace("\"***DATA_GOES_HERE***\"", &d).to_string()
+                (&ws).replace("\"***DATA_GOES_HERE***\"", &d)
             } else {
                 ws
             }
