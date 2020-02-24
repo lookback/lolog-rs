@@ -31,6 +31,8 @@ pub struct LogConf {
     pub app_name: String,
     /// Application version string.
     pub app_version: String,
+    /// API key id for the api key
+    pub api_key_id: String,
     /// API key for loggin to our syslog server.
     pub api_key: String,
     /// Name of host to connect and deliver log messages to.
@@ -43,13 +45,16 @@ impl std::default::Default for LogConf {
     fn default() -> Self {
         LogConf {
             min_level: Level::Info,
-            hostname: hostname::get()
-                .map(|o| o.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "<hostname>".into()),
+            hostname: env::var("SYSLOG_HOSTNAME").unwrap_or_else(|_| {
+                hostname::get()
+                    .map(|o| o.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "<hostname>".into())
+            }),
             env: env::var("ENV").unwrap_or_else(|_| "development".to_string()),
             app_name: "<app name>".into(),
             app_version: "<app version>".into(),
-            api_key: "".into(),
+            api_key_id: env::var("SYSLOG_API_KEY_ID").unwrap_or_else(|_| "".into()),
+            api_key: env::var("SYSLOG_API_KEY").unwrap_or_else(|_| "".into()),
             log_host: env::var("SYSLOG_HOST")
                 .unwrap_or_else(|_| "logrelay.lookback.io".to_string()),
             log_port: env::var("SYSLOG_PORT")
@@ -253,7 +258,11 @@ impl LogBuilder {
             },
             app_name: &self.namespace,
             pid: &self.conf.app_version,
-            api_key_name: &self.conf.app_name,
+            api_key_id: if self.conf.api_key_id.is_empty() {
+                &self.conf.app_name
+            } else {
+                &self.conf.api_key_id
+            },
             api_key: &self.conf.api_key,
             env: &self.conf.env,
         }
@@ -262,10 +271,12 @@ impl LogBuilder {
 
 // replace any char < 32 with a space.
 fn strip_ctrl(s: &str) -> String {
-    s.chars().map(|c| match c {
-        '\x00'..='\x1f' => ' ',
-        _ => c,
-    }).collect()
+    s.chars()
+        .map(|c| match c {
+            '\x00'..='\x1f' => ' ',
+            _ => c,
+        })
+        .collect()
 }
 
 pub trait WellKnownable {
@@ -494,7 +505,7 @@ struct SyslogMessage<'a> {
     app_name: &'a str,
     pid: &'a str,
     msg_id: String,
-    api_key_name: &'a str,
+    api_key_id: &'a str,
     api_key: &'a str,
     env: &'a str,
     message: String,
@@ -518,7 +529,7 @@ impl<'a> fmt::Display for SyslogMessage<'a> {
         // https://pen.iana.org/pen/PenApplication.page
         let strct = format!(
             "[{}@53595 apiKey=\"{}\" env=\"{}\"]",
-            self.api_key_name, self.api_key, self.env
+            self.api_key_id, self.api_key, self.env
         );
         write!(
             f,
