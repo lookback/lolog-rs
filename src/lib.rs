@@ -2,16 +2,21 @@
 
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
+use rustls::ClientConfig;
+use rustls::ClientSession;
+use rustls::StreamOwned;
 use serde::Serialize;
 use std::env;
 use std::fmt;
+use std::io::Write;
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 use uuid::Uuid;
 
 pub use ::log::Level;
-pub use ::log::{debug, error, info, trace, warn, log_enabled};
+pub use ::log::{debug, error, info, log_enabled, trace, warn};
 
 lazy_static! {
     static ref LOG_CONF: Mutex<LogConf> = { Mutex::new(LogConf::new()) };
@@ -39,6 +44,8 @@ pub struct LogConf {
     pub log_host: String,
     /// Port on host to deliver log messages to.
     pub log_port: u16,
+    /// Whether we are to use TLS for logging.
+    pub use_tls: bool,
 }
 
 impl std::default::Default for LogConf {
@@ -61,6 +68,9 @@ impl std::default::Default for LogConf {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(6514),
+            use_tls: env::var("SYSLOG_TLS")
+                .map(|x| x == "1" || x == "true")
+                .unwrap_or(false),
         }
     }
 }
@@ -389,6 +399,40 @@ enum SyslogSeverity {
     Debug = 7,
 }
 
+lazy_static! {
+    static ref TLS_CONF: Arc<ClientConfig> = {
+        let mut config = ClientConfig::new();
+        config
+            .root_store
+            .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+        Arc::new(config)
+    };
+    static ref SOCKET: Mutex<Option<Socket>> = { Mutex::new(None) };
+}
+
+#[allow(clippy::large_enum_variant)]
+enum Socket {
+    Tls(StreamOwned<ClientSession, TcpStream>),
+    Raw(TcpStream),
+}
+
+use std::io;
+
+impl Write for Socket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Socket::Tls(v) => v.write(buf),
+            Socket::Raw(v) => v.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Socket::Tls(v) => v.flush(),
+            Socket::Raw(v) => v.flush(),
+        }
+    }
+}
+
 fn do_log(l: LogBuilder) {
     if l.conf.min_level.as_u8() < l.level.as_u8() {
         return;
@@ -401,24 +445,6 @@ fn do_log(l: LogBuilder) {
     // don't send on stuff without severity
     if l.level.severity().is_none() {
         return;
-    }
-
-    use rustls::ClientConfig;
-    use rustls::ClientSession;
-    use rustls::StreamOwned;
-    use std::io::Write;
-    use std::sync::Arc;
-
-    lazy_static! {
-        static ref TLS_CONF: Arc<ClientConfig> = {
-            let mut config = ClientConfig::new();
-            config
-                .root_store
-                .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-            Arc::new(config)
-        };
-        static ref SOCKET: Mutex<Option<StreamOwned<ClientSession, TcpStream>>> =
-            { Mutex::new(None) };
     }
 
     let mut lock = SOCKET.lock().unwrap();
@@ -435,10 +461,14 @@ fn do_log(l: LogBuilder) {
         if lock.is_none() {
             match connect_host(&l.conf.log_host, l.conf.log_port) {
                 Ok(tcp) => {
-                    // wrap tcp in an ssl session
-                    let sni = webpki::DNSNameRef::try_from_ascii_str(&l.conf.log_host).unwrap();
-                    let sess = rustls::ClientSession::new(&*TLS_CONF, sni);
-                    *lock = Some(StreamOwned::new(sess, tcp));
+                    let sock = if l.conf.use_tls {
+                        let sni = webpki::DNSNameRef::try_from_ascii_str(&l.conf.log_host).unwrap();
+                        let sess = rustls::ClientSession::new(&*TLS_CONF, sni);
+                        Socket::Tls(StreamOwned::new(sess, tcp))
+                    } else {
+                        Socket::Raw(tcp)
+                    };
+                    *lock = Some(sock);
                 }
                 Err(_) => {
                     // try again
