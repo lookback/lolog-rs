@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use uuid::Uuid;
 
 pub use ::log::Level;
-pub use ::log::{debug, error, info, trace, warn};
+pub use ::log::{debug, error, info, trace, warn, log_enabled};
 
 lazy_static! {
     static ref LOG_CONF: Mutex<LogConf> = { Mutex::new(LogConf::new()) };
