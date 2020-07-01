@@ -588,9 +588,9 @@ fn chk(s: &str) -> &str {
 struct SimpleLogger;
 
 impl ::log::Log for SimpleLogger {
-    fn enabled(&self, _metadata: &::log::Metadata) -> bool {
+    fn enabled(&self, metadata: &::log::Metadata) -> bool {
         let conf = LOG_CONF.lock().unwrap();
-        _metadata.target().starts_with(&conf.app_name)
+        metadata.target().starts_with(&conf.app_name) || metadata.target().starts_with("hreq::")
     }
 
     fn log(&self, record: &::log::Record) {
