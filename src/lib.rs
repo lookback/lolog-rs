@@ -46,6 +46,8 @@ pub struct LogConf {
     pub log_port: u16,
     /// Whether we are to use TLS for logging.
     pub use_tls: bool,
+    /// Additional namespaces we are turning on loggging for.
+    pub additional_log: Vec<String>,
 }
 
 impl std::default::Default for LogConf {
@@ -71,6 +73,7 @@ impl std::default::Default for LogConf {
             use_tls: env::var("SYSLOG_TLS")
                 .map(|x| x == "1" || x == "true")
                 .unwrap_or(false),
+            additional_log: vec![],
         }
     }
 }
@@ -590,7 +593,11 @@ struct SimpleLogger;
 impl ::log::Log for SimpleLogger {
     fn enabled(&self, metadata: &::log::Metadata) -> bool {
         let conf = LOG_CONF.lock().unwrap();
-        metadata.target().starts_with(&conf.app_name) || metadata.target().starts_with("hreq::")
+        metadata.target().starts_with(&conf.app_name)
+            || conf
+                .additional_log
+                .iter()
+                .any(|ns| metadata.target().starts_with(ns))
     }
 
     fn log(&self, record: &::log::Record) {
