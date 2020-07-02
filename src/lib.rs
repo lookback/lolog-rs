@@ -1,7 +1,7 @@
 #![warn(clippy::all)]
 
 use chrono::{DateTime, Utc};
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use rustls::ClientConfig;
 use rustls::ClientSession;
 use rustls::StreamOwned;
@@ -18,9 +18,7 @@ use uuid::Uuid;
 pub use ::log::Level;
 pub use ::log::{debug, error, info, log_enabled, trace, warn};
 
-lazy_static! {
-    static ref LOG_CONF: Mutex<LogConf> = { Mutex::new(LogConf::new()) };
-}
+static LOG_CONF: Lazy<Mutex<LogConf>> = Lazy::new(|| Mutex::new(LogConf::new()));
 
 /// Lolog configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,16 +400,14 @@ enum SyslogSeverity {
     Debug = 7,
 }
 
-lazy_static! {
-    static ref TLS_CONF: Arc<ClientConfig> = {
-        let mut config = ClientConfig::new();
-        config
-            .root_store
-            .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-        Arc::new(config)
-    };
-    static ref SOCKET: Mutex<Option<Socket>> = { Mutex::new(None) };
-}
+static TLS_CONF: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+    let mut config = ClientConfig::new();
+    config
+        .root_store
+        .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+    Arc::new(config)
+});
+static SOCKET: Lazy<Mutex<Option<Socket>>> = Lazy::new(|| Mutex::new(None));
 
 #[allow(clippy::large_enum_variant)]
 enum Socket {
