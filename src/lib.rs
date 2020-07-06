@@ -615,6 +615,43 @@ impl ::log::Log for SimpleLogger {
     fn flush(&self) {}
 }
 
+/// Exit process helper.
+///
+/// Standardized codes: https://www.notion.so/lookback/2883ab4e80914944b25a065154c554dd?v=66e7cb924934474aae5996448a870367
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Abort {
+    MissingEnvVar,
+    UncaughtException,
+    DatabaseError,
+    LoggingError,
+    SideboatInitError,
+    ProhibitedSyscall,
+    PermissionDenied,
+    OutOfMemory,
+}
+
+impl Abort {
+    pub fn code(&self) -> i32 {
+        match self {
+            Abort::MissingEnvVar => 10,
+            Abort::UncaughtException => 11,
+            Abort::DatabaseError => 12,
+            Abort::LoggingError => 13,
+            Abort::SideboatInitError => 14,
+            Abort::ProhibitedSyscall => 15,
+            Abort::PermissionDenied => 16,
+            Abort::OutOfMemory => 17,
+        }
+    }
+
+    pub fn abort(&self, msg: &str) -> ! {
+        warn!("({}): {}", self.code(), msg);
+        // allow logging message to be sent
+        std::thread::sleep(Duration::from_secs(2));
+        std::process::exit(self.code());
+    }
+}
+
 use ::log::LevelFilter;
 
 static LOGGER: SimpleLogger = SimpleLogger;
