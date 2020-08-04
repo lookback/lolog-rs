@@ -645,10 +645,19 @@ impl Abort {
     }
 
     pub fn abort(&self, msg: &str) -> ! {
-        warn!("({}): {}", self.code(), msg);
+        let msg = format!("({}): {}", self.code(), msg);
+        println!("{}", msg);
+        warn!("{}", msg);
         // allow logging message to be sent
         std::thread::sleep(Duration::from_secs(2));
         std::process::exit(self.code());
+    }
+}
+
+pub fn flush() {
+    let mut lock = SOCKET.lock().unwrap();
+    if let Some(socket) = &mut *lock {
+        socket.flush().ok();
     }
 }
 
