@@ -6,6 +6,7 @@ use rustls::ClientConfig;
 use rustls::ClientSession;
 use rustls::StreamOwned;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::Write;
@@ -18,7 +19,8 @@ use uuid::Uuid;
 pub use ::log::Level;
 pub use ::log::{debug, error, info, log_enabled, trace, warn};
 
-static LOG_CONF: Lazy<Mutex<LogConf>> = Lazy::new(|| Mutex::new(LogConf::new()));
+static LOG_CONF: Lazy<Mutex<Arc<LogConf>>> = Lazy::new(|| Mutex::new(Arc::new(LogConf::new())));
+static LOG_RETAIN: Lazy<Mutex<LogRetain>> = Lazy::new(|| Mutex::new(LogRetain::new()));
 
 /// Lolog configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +109,7 @@ pub fn log_level_enabled(level: Level) -> bool {
 /// Log builders allows more fine grained details to be sent to the logging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogBuilder {
-    conf: LogConf,
+    conf: Arc<LogConf>,
     timestamp: SystemTime,
     level: Level,
     namespace: String,
@@ -115,6 +117,7 @@ pub struct LogBuilder {
     well_known: Option<WellKnown>,
     actual_data: Option<String>,
     use_uuid: bool,
+    retention_id: Option<String>,
 }
 
 /// Format as a syslog row.
@@ -152,6 +155,7 @@ impl std::default::Default for LogBuilder {
             well_known: None,
             actual_data: None,
             use_uuid: true,
+            retention_id: None,
         }
     }
 }
@@ -162,11 +166,13 @@ impl LogBuilder {
         self.timestamp = timestamp;
         self
     }
+
     /// Make a subsystem name under the application name. I.e. `ios` vs `ios.bcast`.
     pub fn subname(mut self, subname: &str) -> LogBuilder {
         self.namespace = format!("{}.{}", self.namespace, subname);
         self
     }
+
     /// Provide some JSON serializable data to be included in the message.
     pub fn data<T: Serialize>(mut self, data: &T) -> LogBuilder {
         let data = serde_json::to_string(data).expect("Failed to serialize json");
@@ -174,22 +180,26 @@ impl LogBuilder {
         self.with_wk().data.replace("***DATA_GOES_HERE***");
         self
     }
+
     /// Provide some JSON serializable data as a str.
     pub fn data_str(mut self, data: &str) -> LogBuilder {
         self.actual_data.replace(data.to_string());
         self.with_wk().data.replace("***DATA_GOES_HERE***");
         self
     }
+
     /// Set recording id this log message belongs to.
     pub fn recording_id(mut self, recording_id: &str) -> LogBuilder {
         self.with_wk().recordingId.replace(recording_id.to_string());
         self
     }
+
     /// Set user id this log message belongs to.
     pub fn user_id(mut self, user_id: &str) -> LogBuilder {
         self.with_wk().userId.replace(user_id.to_string());
         self
     }
+
     /// Set the user id, if it is there.
     pub fn maybe_user_id(mut self, user_id: &Option<String>) -> LogBuilder {
         if let Some(user_id) = user_id {
@@ -197,11 +207,13 @@ impl LogBuilder {
         }
         self
     }
+
     /// Set the session id this belongs to.
     pub fn session_id(mut self, session_id: &str) -> LogBuilder {
         self.with_wk().sessionId.replace(session_id.to_string());
         self
     }
+
     /// Set the session id, if it is there.
     pub fn maybe_session_id(mut self, session_id: &Option<String>) -> LogBuilder {
         if let Some(session_id) = session_id {
@@ -209,20 +221,25 @@ impl LogBuilder {
         }
         self
     }
+
     /// Provide the user ip address.
     pub fn user_ip(mut self, user_ip: &str) -> LogBuilder {
         self.with_wk().userIp.replace(user_ip.to_string());
         self
     }
+
     /// Suppress the use of a uuid as msg id, if need be. Default is on.
     pub fn use_uuid(mut self, use_uuid: bool) -> LogBuilder {
         self.use_uuid = use_uuid;
         self
     }
-    /// Consume and send this log row.
-    pub fn send(self) {
-        do_log(self);
+
+    pub fn retention_id(mut self, id: &str) -> LogBuilder {
+        self.retention_id = Some(id.to_string());
+        self
     }
+
+    /// Provide a bunch of well knowns in one go.
     pub fn well_knownable(mut self, wk: &dyn WellKnownable) -> LogBuilder {
         if let Some(recording_id) = wk.recording_id() {
             self.with_wk().recordingId.replace(recording_id);
@@ -238,6 +255,12 @@ impl LogBuilder {
         }
         self
     }
+
+    /// Consume and send this log row.
+    pub fn send(self) {
+        do_log(self);
+    }
+
     fn with_wk(&mut self) -> &mut WellKnown {
         self.well_known.get_or_insert_with(|| WellKnown {
             ..Default::default()
@@ -435,15 +458,30 @@ impl Write for Socket {
     }
 }
 
-fn do_log(l: LogBuilder) {
-    if l.conf.min_level.as_u8() < l.level.as_u8() {
+fn do_log(mut l: LogBuilder) {
+    //
+    // In memory-log retention is always DEBUG level and above.
+    if Level::Debug.as_u8() <= l.level.as_u8() {
+        //
+        // only if there is a retention id.
+        if let Some(recording_id) = l.retention_id.take() {
+            let mut lock = LOG_RETAIN.lock().unwrap();
+
+            lock.add_row(recording_id, &l);
+        }
+    }
+
+    // All other obey conf.
+    if l.conf.min_level.as_u8() <= l.level.as_u8() {
         return;
     }
-    // do print all levels locally.
+
+    // do print all enabled levels locally.
     if !l.conf.use_syslog() {
         eprintln!("{}", l);
         return;
     }
+
     // don't send on stuff without severity
     if l.level.severity().is_none() {
         return;
@@ -678,8 +716,11 @@ static LOGGER: SimpleLogger = SimpleLogger;
 
 /// Configure the logger by providing the conf for it.
 pub fn setup_logger(conf: LogConf) {
-    let mut lock = LOG_CONF.lock().unwrap();
-    *lock = conf;
+    {
+        let mut lock = LOG_CONF.lock().unwrap();
+        *lock = Arc::new(conf);
+    }
+
     static INIT: ::std::sync::Once = ::std::sync::Once::new();
     INIT.call_once(|| {
         ::log::set_logger(&LOGGER)
@@ -793,4 +834,40 @@ mod tests {
              \"sessionId\":\"my session\",\"data\":{\"stuff\":42}}\n"
         );
     }
+}
+
+struct LogRetain {
+    retained: HashMap<String, Vec<String>>,
+}
+
+impl LogRetain {
+    fn new() -> Self {
+        LogRetain {
+            retained: HashMap::new(),
+        }
+    }
+
+    fn add_row(&mut self, retention_id: String, l: &LogBuilder) {
+        let rows = self.retained.entry(retention_id).or_insert_with(Vec::new);
+
+        rows.push(format!("{}", l));
+    }
+}
+
+/// Obtain the retained rows for a given retention_id. Empty array if no such rows.
+pub fn retain_obtain<F: FnOnce(&Vec<String>)>(retention_id: &str, f: F) {
+    let lock = LOG_RETAIN.lock().unwrap();
+    if let Some(v) = lock.retained.get(retention_id) {
+        f(v);
+    } else {
+        let v = Vec::with_capacity(0);
+        f(&v);
+    }
+}
+
+/// Discard retained rows for a given retention_id.
+pub fn retain_discard(retention_id: &str) {
+    let mut lock = LOG_RETAIN.lock().unwrap();
+
+    lock.retained.remove(retention_id);
 }
