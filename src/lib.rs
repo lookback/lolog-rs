@@ -413,6 +413,7 @@ static SOCKET: Lazy<Mutex<Option<Socket>>> = Lazy::new(|| Mutex::new(None));
 enum Socket {
     Tls(StreamOwned<ClientSession, TcpStream>),
     Raw(TcpStream),
+    Void,
 }
 
 use std::io;
@@ -422,12 +423,14 @@ impl Write for Socket {
         match self {
             Socket::Tls(v) => v.write(buf),
             Socket::Raw(v) => v.write(buf),
+            Socket::Void => Ok(buf.len()),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Socket::Tls(v) => v.flush(),
             Socket::Raw(v) => v.flush(),
+            Socket::Void => Ok(()),
         }
     }
 }
@@ -648,6 +651,14 @@ impl Abort {
         let msg = format!("({}): {}", self.code(), msg);
         println!("{}", msg);
         warn!("{}", msg);
+        // close socket
+        {
+            let mut lock = SOCKET.lock().unwrap();
+            if let Some(socket) = &mut *lock {
+                socket.flush().ok();
+                *socket = Socket::Void;
+            }
+        }
         // allow logging message to be sent
         std::thread::sleep(Duration::from_secs(2));
         std::process::exit(self.code());
