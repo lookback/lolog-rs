@@ -461,7 +461,7 @@ impl Write for Socket {
 fn do_log(mut l: LogBuilder) {
     //
     // In memory-log retention is always DEBUG level and above.
-    if Level::Debug.as_u8() <= l.level.as_u8() {
+    if l.level.as_u8() <= Level::Debug.as_u8() {
         //
         // only if there is a retention id.
         if let Some(recording_id) = l.retention_id.take() {
@@ -472,7 +472,7 @@ fn do_log(mut l: LogBuilder) {
     }
 
     // All other obey conf.
-    if l.conf.min_level.as_u8() <= l.level.as_u8() {
+    if l.level.as_u8() > l.conf.min_level.as_u8() {
         return;
     }
 
