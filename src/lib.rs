@@ -3,10 +3,11 @@
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use rustls::ClientConfig;
-use rustls::ClientSession;
+use rustls::ClientConnection;
 use rustls::StreamOwned;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::env;
 use std::fmt;
 use std::io::Write;
@@ -424,17 +425,30 @@ enum SyslogSeverity {
 }
 
 static TLS_CONF: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
-    let mut config = ClientConfig::new();
-    config
-        .root_store
-        .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+    fn root_certs() -> rustls::RootCertStore {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                ta.subject,
+                ta.spki,
+                ta.name_constraints,
+            )
+        }));
+        root_store
+    }
+
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_certs())
+        .with_no_client_auth();
+
     Arc::new(config)
 });
 static SOCKET: Lazy<Mutex<Option<Socket>>> = Lazy::new(|| Mutex::new(None));
 
 #[allow(clippy::large_enum_variant)]
 enum Socket {
-    Tls(StreamOwned<ClientSession, TcpStream>),
+    Tls(StreamOwned<ClientConnection, TcpStream>),
     Raw(TcpStream),
     Void,
 }
@@ -502,8 +516,14 @@ fn do_log(mut l: LogBuilder) {
             match connect_host(&l.conf.log_host, l.conf.log_port) {
                 Ok(tcp) => {
                     let sock = if l.conf.use_tls {
-                        let sni = webpki::DNSNameRef::try_from_ascii_str(&l.conf.log_host).unwrap();
-                        let sess = rustls::ClientSession::new(&*TLS_CONF, sni);
+                        let name = l
+                            .conf
+                            .log_host
+                            .as_str()
+                            .try_into()
+                            .expect("SNI server name");
+                        let sess = rustls::ClientConnection::new(TLS_CONF.clone(), name)
+                            .expect("rustls client conn");
                         Socket::Tls(StreamOwned::new(sess, tcp))
                     } else {
                         Socket::Raw(tcp)
