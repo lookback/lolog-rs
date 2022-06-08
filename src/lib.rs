@@ -1,40 +1,37 @@
-#![warn(clippy::all)]
+#[macro_use]
+extern crate tracing;
+
+use std::convert::TryInto;
+use std::io::{self, Write};
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
+use std::{env, fmt, process};
 
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
-use rustls::ClientConfig;
-use rustls::ClientConnection;
-use rustls::StreamOwned;
+use rustls::client::InvalidDnsNameError;
+use rustls::{ClientConfig, ClientConnection, OwnedTrustAnchor, RootCertStore, StreamOwned};
 use serde::Serialize;
-use std::collections::HashMap;
-use std::convert::TryInto;
-use std::env;
-use std::fmt;
-use std::io::Write;
-use std::net::TcpStream;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::SystemTime;
-use uuid::Uuid;
+use serde_json::{Map, Value};
+use tracing::span::Attributes;
+use tracing::{field, Event, Span, Subscriber};
+use tracing_core::span::{Id, Record};
+use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{prelude::*, registry::LookupSpan};
 
-pub use ::log::Level;
-pub use ::log::{debug, error, info, log_enabled, trace, warn};
+mod visitor;
 
-static LOG_CONF: Lazy<Mutex<Arc<LogConf>>> = Lazy::new(|| Mutex::new(Arc::new(LogConf::new())));
-static LOG_RETAIN: Lazy<Mutex<LogRetain>> = Lazy::new(|| Mutex::new(LogRetain::new()));
-
-/// Lolog configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogConf {
-    /// Minimum visible log level. Defaults to INFO.
-    pub min_level: Level,
+pub struct LogConfig {
+    /// Name of application. This is the default `namespace` in log messages. Can be appended
+    /// to, compare `ios` vs `ios.bcast`. It is also used as `api_key_name`.
+    pub app_name: String,
     /// Hostname of syslog entries from this instance. Default is OS hostname.
     pub hostname: String,
     /// Env of syslog entries. Default is the ENV variable, and otherwise "development".
     pub env: String,
-    /// Name of application. This is the default `namespace` in log messages. Can be appended
-    /// to, compare `ios` vs `ios.bcast`. It is also used as `api_key_name`.
-    pub app_name: String,
+    /// Process id.
+    pub pid: u32,
     /// Application version string.
     pub app_version: String,
     /// API key id for the api key
@@ -47,20 +44,18 @@ pub struct LogConf {
     pub log_port: u16,
     /// Whether we are to use TLS for logging.
     pub use_tls: bool,
-    /// Additional namespaces we are turning on loggging for.
-    pub additional_log: Vec<String>,
 }
 
-impl std::default::Default for LogConf {
+impl Default for LogConfig {
     fn default() -> Self {
-        LogConf {
-            min_level: Level::Info,
+        LogConfig {
             hostname: env::var("SYSLOG_HOSTNAME").unwrap_or_else(|_| {
                 hostname::get()
                     .map(|o| o.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "<hostname>".into())
             }),
             env: env::var("ENV").unwrap_or_else(|_| "development".to_string()),
+            pid: process::id(),
             app_name: "<app name>".into(),
             app_version: "<app version>".into(),
             api_key_id: env::var("SYSLOG_API_KEY_ID").unwrap_or_else(|_| "".into()),
@@ -74,322 +69,446 @@ impl std::default::Default for LogConf {
             use_tls: env::var("SYSLOG_TLS")
                 .map(|x| x == "1" || x == "true")
                 .unwrap_or(false),
-            additional_log: vec![],
         }
     }
 }
 
-impl LogConf {
-    /// Create a new LogConf. Also consider using `Default::default()`.
-    pub fn new() -> Self {
-        LogConf {
-            ..Default::default()
-        }
-    }
-    fn use_syslog(&self) -> bool {
-        !self.api_key.is_empty()
-    }
+/// Logging implementation for tracing crate.
+pub struct Logger {
+    /// The config of the logging system.
+    config: Arc<LogConfig>,
+    /// Base record with fields that don't change.
+    base_record: Arc<LogRecord>,
 }
 
-/// Start logging a simple message to the logger. The returned builder must be called
-/// `.send()` upon to actually send the message.
-pub fn log(level: Level, message: &str) -> LogBuilder {
-    LogBuilder {
-        level,
-        message: message.to_string(),
-        ..Default::default()
-    }
-}
+impl Logger {
+    pub fn init(config: LogConfig) -> Result<(), Error> {
+        assert!(config.use_tls, "Must use TLS for logging");
 
-/// Check if the given log level is enabled.
-pub fn log_level_enabled(level: Level) -> bool {
-    let conf = LOG_CONF.lock().unwrap();
-    conf.min_level.as_u8() >= level.as_u8()
-}
+        let config = Arc::new(config);
 
-/// Log builders allows more fine grained details to be sent to the logging.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogBuilder {
-    conf: Arc<LogConf>,
-    timestamp: SystemTime,
-    level: Level,
-    namespace: String,
-    message: String,
-    well_known: Option<WellKnown>,
-    actual_data: Option<String>,
-    use_uuid: bool,
-    retention_id: Option<String>,
-}
-
-/// Format as a syslog row.
-impl fmt::Display for LogBuilder {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let dt: DateTime<Utc> = self.timestamp.into();
-        // 13:12:27.000
-        let time = dt.format("%H:%M:%S%.3f");
-        let json_extra = self.json_extra();
-        write!(
-            f,
-            "{} {} {}{}",
-            time,
-            self.level.to_str(),
-            self.message,
-            if json_extra.is_empty() {
-                "".to_string()
+        let base_record = Arc::new(LogRecord {
+            facility: Arc::new(SyslogFacility::Local1),
+            hostname: Arc::new(config.hostname.clone()),
+            app_name: Arc::new(config.app_name.clone()),
+            pid: config.pid,
+            api_key_id: Arc::new(if config.api_key_id.is_empty() {
+                config.app_name.clone()
             } else {
-                format!(" {}", json_extra)
-            }
-        )
-    }
-}
+                config.api_key_id.clone()
+            }),
+            api_key: Arc::new(config.api_key.clone()),
+            env: Arc::new(config.env.clone()),
 
-impl std::default::Default for LogBuilder {
-    fn default() -> Self {
-        let conf = { LOG_CONF.lock().unwrap().clone() };
-        let namespace = conf.app_name.to_string();
-        LogBuilder {
-            conf,
-            timestamp: SystemTime::now(),
-            level: Level::Info,
-            namespace,
-            message: "".to_string(),
+            severity: SyslogSeverity::Informational,
+            msg_id: "".to_string(),
+            timestamp: Utc::now(),
+            message: None,
             well_known: None,
-            actual_data: None,
-            use_uuid: true,
-            retention_id: None,
-        }
+        });
+
+        let logger = Logger {
+            config,
+            base_record,
+        };
+
+        // Compose our logger layer with the "EnvFilter" which is set via
+        // RUST_LOG=xxx standard syntax.
+        let filter = EnvFilter::from_default_env();
+        let filtered_logger = logger.with_filter(filter);
+        let subscriber = tracing_subscriber::registry().with(filtered_logger);
+
+        #[cfg(feature = "tokio_console")]
+        let subscriber = subscriber.with(console_subscriber::spawn());
+
+        tracing_core::dispatcher::set_global_default(tracing_core::dispatcher::Dispatch::new(
+            subscriber,
+        ))
+        .expect("Setting global logger dispatcher");
+
+        Ok(())
     }
 }
 
-impl LogBuilder {
-    /// Add an explicit timestamp to this message.
-    pub fn timestamp(mut self, timestamp: SystemTime) -> LogBuilder {
-        self.timestamp = timestamp;
-        self
-    }
+impl<S> Layer<S> for Logger
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let span = ctx.span(id).expect("Span not found, this is a bug");
 
-    /// Make a subsystem name under the application name. I.e. `ios` vs `ios.bcast`.
-    pub fn subname(mut self, subname: &str) -> LogBuilder {
-        self.namespace = format!("{}.{}", self.namespace, subname);
-        self
-    }
+        let mut extensions = span.extensions_mut();
 
-    /// Provide some JSON serializable data to be included in the message.
-    pub fn data<T: Serialize>(mut self, data: &T) -> LogBuilder {
-        let data = serde_json::to_string(data).expect("Failed to serialize json");
-        self.actual_data.replace(data);
-        self.with_wk().data.replace("***DATA_GOES_HERE***");
-        self
-    }
-
-    /// Provide some JSON serializable data as a str.
-    pub fn data_str(mut self, data: &str) -> LogBuilder {
-        self.actual_data.replace(data.to_string());
-        self.with_wk().data.replace("***DATA_GOES_HERE***");
-        self
-    }
-
-    /// Set recording id this log message belongs to.
-    pub fn recording_id(mut self, recording_id: &str) -> LogBuilder {
-        self.with_wk().recordingId.replace(recording_id.to_string());
-        self
-    }
-
-    /// Set user id this log message belongs to.
-    pub fn user_id(mut self, user_id: &str) -> LogBuilder {
-        self.with_wk().userId.replace(user_id.to_string());
-        self
-    }
-
-    /// Set the user id, if it is there.
-    pub fn maybe_user_id(mut self, user_id: &Option<String>) -> LogBuilder {
-        if let Some(user_id) = user_id {
-            self.with_wk().userId.replace(user_id.clone());
+        if extensions.get_mut::<Map<String, Value>>().is_none() {
+            let mut object = Map::with_capacity(16);
+            let mut visitor = visitor::AdditionalFieldVisitor::new(&mut object);
+            attrs.record(&mut visitor);
+            extensions.insert(object);
         }
-        self
     }
 
-    /// Set the session id this belongs to.
-    pub fn session_id(mut self, session_id: &str) -> LogBuilder {
-        self.with_wk().sessionId.replace(session_id.to_string());
-        self
-    }
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        let span = ctx.span(id).expect("Span not found, this is a bug");
 
-    /// Set the session id, if it is there.
-    pub fn maybe_session_id(mut self, session_id: &Option<String>) -> LogBuilder {
-        if let Some(session_id) = session_id {
-            self.with_wk().sessionId.replace(session_id.clone());
-        }
-        self
-    }
+        let mut extensions = span.extensions_mut();
 
-    /// Provide the user ip address.
-    pub fn user_ip(mut self, user_ip: &str) -> LogBuilder {
-        self.with_wk().userIp.replace(user_ip.to_string());
-        self
-    }
-
-    /// Suppress the use of a uuid as msg id, if need be. Default is on.
-    pub fn use_uuid(mut self, use_uuid: bool) -> LogBuilder {
-        self.use_uuid = use_uuid;
-        self
-    }
-
-    pub fn retention_id(mut self, id: &str) -> LogBuilder {
-        self.retention_id = Some(id.to_string());
-        self
-    }
-
-    /// Provide a bunch of well knowns in one go.
-    pub fn well_knownable(mut self, wk: &dyn WellKnownable) -> LogBuilder {
-        if let Some(recording_id) = wk.recording_id() {
-            self.with_wk().recordingId.replace(recording_id);
-        }
-        if let Some(user_id) = wk.user_id() {
-            self.with_wk().userId.replace(user_id);
-        }
-        if let Some(user_ip) = wk.user_ip() {
-            self.with_wk().userIp.replace(user_ip);
-        }
-        if let Some(session_id) = wk.session_id() {
-            self.with_wk().sessionId.replace(session_id);
-        }
-        self
-    }
-
-    /// Consume and send this log row.
-    pub fn send(self) {
-        do_log(self);
-    }
-
-    fn with_wk(&mut self) -> &mut WellKnown {
-        self.well_known.get_or_insert_with(|| WellKnown {
-            ..Default::default()
-        })
-    }
-    fn json_extra(&self) -> String {
-        if let Some(wk) = &self.well_known {
-            let ws = serde_json::to_string(wk).expect("Failed to serialize json");
-            if let Some(d) = &self.actual_data {
-                (&ws).replace("\"***DATA_GOES_HERE***\"", &d)
-            } else {
-                ws
-            }
+        if let Some(object) = extensions.get_mut::<Map<String, Value>>() {
+            let mut add_field_visitor = visitor::AdditionalFieldVisitor::new(object);
+            values.record(&mut add_field_visitor);
         } else {
-            "".to_string()
+            let mut object = Map::with_capacity(16);
+            let mut add_field_visitor = visitor::AdditionalFieldVisitor::new(&mut object);
+            values.record(&mut add_field_visitor);
+            extensions.insert(object)
         }
     }
-    fn to_syslog(&self) -> SyslogMessage {
-        SyslogMessage {
-            facility: SyslogFacility::Local1,
-            severity: self.level.severity().expect("Translate severity"),
-            message: format!("{} {}", strip_ctrl(&self.message), self.json_extra(),),
-            hostname: &self.conf.hostname,
-            timestamp: &self.timestamp,
-            msg_id: if self.use_uuid {
-                Uuid::new_v4().to_string()
-            } else {
-                "".to_string()
-            },
-            app_name: &self.namespace,
-            pid: &self.conf.app_version,
-            api_key_id: if self.conf.api_key_id.is_empty() {
-                &self.conf.app_name
-            } else {
-                &self.conf.api_key_id
-            },
-            api_key: &self.conf.api_key,
-            env: &self.conf.env,
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let mut record = (*self.base_record).clone();
+        let mut json = Map::with_capacity(16);
+        record.timestamp = Utc::now();
+
+        let scope = ctx.event_scope(event);
+
+        if let Some(scope) = scope {
+            // TODO:it's unclear whether we want to log the span names.
+            let _spans = scope.fold(String::new(), |mut spans, span| {
+                // Add fields captured in spans to the json object.
+                if let Some(span_object) = span.extensions().get::<Map<String, Value>>() {
+                    json.extend(span_object.clone());
+                }
+
+                if !spans.is_empty() {
+                    spans = format!("{}:{}", spans, span.name());
+                } else {
+                    spans = span.name().to_string();
+                }
+
+                spans
+            });
         }
+
+        let metadata = event.metadata();
+
+        record.severity = match *metadata.level() {
+            tracing_core::Level::ERROR => SyslogSeverity::Error,
+            tracing_core::Level::WARN => SyslogSeverity::Warning,
+            tracing_core::Level::INFO => SyslogSeverity::Informational,
+            tracing_core::Level::DEBUG => SyslogSeverity::Debug,
+            tracing_core::Level::TRACE => SyslogSeverity::Trace,
+        };
+
+        // Data saved in the event itself.
+        let mut add_field_visitor = visitor::AdditionalFieldVisitor::new(&mut json);
+        event.record(&mut add_field_visitor);
+
+        trait ToStr {
+            fn as_string(&self) -> String;
+        }
+
+        impl ToStr for Value {
+            fn as_string(&self) -> String {
+                match self {
+                    Value::Bool(v) => format!("{}", v),
+                    Value::Number(v) => format!("{}", v),
+                    Value::String(v) => v.clone(),
+                    _ => panic!("Unexpected value {:?}", self),
+                }
+            }
+        }
+
+        // "message" is recorded as a separate field in tracig, but goes in separate field
+        // in our own logging.
+        record.message = json.remove("message").map(|v| v.as_string());
+
+        // Rows bridged in from "log" crate via tracing-log have these additional properties.
+        // "log.file":"/Users/martin/.cargo/registry/src/github.com-1ecc6299db9ec823/webrtc-dtls-0.5.1/src/handshake/handshake_message_client_hello.rs"
+        // "log.line":172
+        // "log.module_path":"webrtc_dtls::handshake::handshake_message_client_hello"
+        // "log.target":"webrtc_dtls::handshake::handshake_message_client_hello"
+
+        if let Some(target) = json.remove("log.target") {
+            if let Some(message) = record.message {
+                record.message = Some(format!("{} {}", target.as_string(), message));
+            } else {
+                record.message = Some(target.as_string());
+            }
+        }
+
+        // Strip all "log." properties since we don't want that messing up the output
+        json.retain(|k, _| !k.starts_with("log."));
+
+        if !json.is_empty() {
+            // Values that goes into WellKnown.
+            let mut wk = WellKnown {
+                recordingId: json.remove("recordingId").map(|v| v.as_string()),
+                userId: json.remove("userId").map(|v| v.as_string()),
+                teamId: json.remove("teamId").map(|v| v.as_string()),
+                userIp: json.remove("userIp").map(|v| v.as_string()),
+                sessionId: json.remove("sessionId").map(|v| v.as_string()),
+                metricGroup: json.remove("metricGroup").map(|v| v.as_string()),
+
+                ..Default::default()
+            };
+
+            // Rest is data
+            if !json.is_empty() {
+                wk.data = Some(json);
+            }
+
+            record.well_known = Some(wk);
+        }
+
+        let log_host = self.config.log_host.as_str();
+        let log_port = self.config.log_port;
+        handle_log_record(log_host, log_port, record);
     }
 }
 
-// replace any char < 32 with a space.
-fn strip_ctrl(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '\x00'..='\x1f' => ' ',
-            _ => c,
-        })
-        .collect()
-}
+#[derive(Debug, Clone)]
+struct LogRecord {
+    facility: Arc<SyslogFacility>,
+    hostname: Arc<String>,
+    app_name: Arc<String>,
+    pid: u32,
+    api_key_id: Arc<String>,
+    api_key: Arc<String>,
+    env: Arc<String>,
 
-pub trait WellKnownable {
-    fn recording_id(&self) -> Option<String> {
-        None
-    }
-    fn user_id(&self) -> Option<String> {
-        None
-    }
-    fn user_ip(&self) -> Option<String> {
-        None
-    }
-    fn session_id(&self) -> Option<String> {
-        None
-    }
+    severity: SyslogSeverity,
+    msg_id: String,
+    timestamp: DateTime<Utc>,
+    message: Option<String>,
+    well_known: Option<WellKnown>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Default)]
 #[allow(non_snake_case)]
-struct WellKnown {
+pub struct WellKnown {
     #[serde(skip_serializing_if = "Option::is_none")]
-    recordingId: Option<String>,
+    pub recordingId: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    userId: Option<String>,
+    pub userId: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    userIp: Option<String>,
+    pub teamId: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    sessionId: Option<String>,
+    pub userIp: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<&'static str>,
+    pub sessionId: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metricGroup: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Map<String, Value>>,
 }
 
-trait LevelExt {
-    fn to_str(&self) -> &str;
-    fn severity(&self) -> Option<SyslogSeverity>;
-    fn as_u8(&self) -> u8;
+impl WellKnown {
+    pub fn info_span(&self, name: &str) -> Span {
+        let span = info_span!(
+            "{}",
+            name,
+            // To allow fields to be set late (after the span is created), using record_in_span below,
+            // we must declare all the fields that we intend to record late.
+            recordingId = field::Empty,
+            userId = field::Empty,
+            teamId = field::Empty,
+            userIp = field::Empty,
+            sessionId = field::Empty,
+            metricGroup = field::Empty,
+        );
+
+        self.record_in_span(&span);
+
+        span
+    }
+
+    pub fn record_in_current(&self) {
+        self.record_in_span(&Span::current());
+    }
+
+    fn record_in_span(&self, span: &Span) {
+        if let Some(v) = &self.recordingId {
+            span.record("recordingId", &v.as_str());
+        }
+        if let Some(v) = &self.userId {
+            span.record("userId", &v.as_str());
+        }
+        if let Some(v) = &self.teamId {
+            span.record("teamId", &v.as_str());
+        }
+        if let Some(v) = &self.userIp {
+            span.record("userIp", &v.as_str());
+        }
+        if let Some(v) = &self.sessionId {
+            span.record("sessionId", &v.as_str());
+        }
+        if let Some(v) = &self.metricGroup {
+            span.record("metricGroup", &v.as_str());
+        }
+    }
 }
 
-impl LevelExt for Level {
-    fn to_str(&self) -> &str {
-        match self {
-            Level::Trace => "TRACE",
-            Level::Debug => "DEBUG",
-            Level::Info => "INFO",
-            Level::Warn => "WARN",
-            Level::Error => "ERROR",
+// singleton log connection.
+static LOG_CONN: Lazy<Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// Send messages to log server
+fn handle_log_record(log_host: &str, log_port: u16, r: LogRecord) {
+    use colorful::Color;
+    use colorful::Colorful;
+
+    let color = {
+        use SyslogSeverity::*;
+        match r.severity {
+            Emergency | Alert | Critical | Error => Color::Red,
+            Warning => Color::Yellow,
+            Notice => Color::Purple3,
+            Informational => Color::Green3a,
+            Debug => Color::CadetBlue1,
+            Trace => Color::Pink3,
         }
+    };
+
+    // The SYSLOG_API_KEY env var goes into this field, and is the best implicit way to detect
+    // that we want to send to the log host. An alternative would be to implement a direct
+    // config option like "disable_console".
+    let send_to_host = !r.api_key.is_empty();
+
+    // don't log to console when we are sending to host, this to avoid double logging when
+    // deployed in frontloader which also forwards console to the log servers.
+    if !send_to_host {
+        let row_color = format!(
+            "{} {}  {} {}",
+            r.timestamp.format("%H:%M:%S%.3f"),
+            format!("{:5}", r.severity.to_string()).color(color).bold(),
+            r.message.as_deref().unwrap_or(""),
+            if let Some(wk) = &r.well_known {
+                serde_json::to_string(&wk).expect("json serialize")
+            } else {
+                "".to_string()
+            },
+        );
+
+        eprintln!("{}", row_color);
+
+        return;
     }
-    fn severity(&self) -> Option<SyslogSeverity> {
-        match self {
-            Level::Trace => None,
-            Level::Debug => Some(SyslogSeverity::Debug),
-            Level::Info => Some(SyslogSeverity::Informational),
-            Level::Warn => Some(SyslogSeverity::Warning),
-            Level::Error => Some(SyslogSeverity::Error),
+
+    if r.severity >= SyslogSeverity::Trace {
+        // Never log TRACE to the log server.
+        return;
+    }
+
+    let mut log_conn = LOG_CONN.lock().unwrap();
+
+    // reconnect loop
+    loop {
+        // Connect up TLS connection to log server.
+        if log_conn.is_none() {
+            match connect(log_host, log_port) {
+                Ok(v) => {
+                    *log_conn = Some(v);
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to log host: {:?}", e);
+
+                    // TODO: Do we need backoff here? Since the logging is sync, it
+                    // would lock up the callsite.
+
+                    continue;
+                }
+            }
         }
-    }
-    fn as_u8(&self) -> u8 {
-        match self {
-            Level::Trace => 5,
-            Level::Debug => 4,
-            Level::Info => 3,
-            Level::Warn => 2,
-            Level::Error => 1,
+
+        let str = r.to_string();
+        let bytes = str.as_bytes();
+
+        let stream = log_conn.as_mut().expect("Existing log connection");
+
+        match stream.write_all(bytes).and_then(|_| stream.flush()) {
+            Ok(_) => {
+                // Log message sent successfully.
+                break;
+            }
+            Err(e) => {
+                eprintln!("Log connection failed: {:?}", e);
+
+                // Remove previous failed connection to trigger reconnect.
+                *log_conn = None;
+            }
         }
     }
 }
 
-/// Parse a level string such as "info" or "Info" or "INFO" to corresponding level.
-/// Handles `trace`, `debug`, `info`, `warn`, and `error`.
-pub fn level_from_str(s: &str) -> Level {
-    match s.to_lowercase().as_str() {
-        "trace" => Level::Trace,
-        "debug" => Level::Debug,
-        "info" => Level::Info,
-        "warn" => Level::Warn,
-        "error" => Level::Error,
-        _ => Level::Info,
+/// Connect a TLS connection to the log server.
+fn connect(
+    log_host: &str,
+    log_port: u16,
+) -> Result<StreamOwned<ClientConnection, TcpStream>, Error> {
+    let addr = format!("{}:{}", log_host, log_port);
+
+    let sock = TcpStream::connect(&addr)?;
+
+    let mut root_store = RootCertStore::empty();
+    root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject,
+            ta.spki,
+            ta.name_constraints,
+        )
+    }));
+
+    let tls_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let server_name = log_host.try_into()?;
+    let conn = ClientConnection::new(Arc::new(tls_config), server_name)?;
+
+    let stream = StreamOwned::new(conn, sock);
+
+    Ok(stream)
+}
+
+///
+/// Standardized codes: https://www.notion.so/lookback/2883ab4e80914944b25a065154c554dd?v=66e7cb924934474aae5996448a870367
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Abort {
+    Clean = 0,
+    MissingEnvVar = 10,
+    UncaughtException = 11,
+    DatabaseError = 12,
+    LoggingError = 13,
+    SideboatInitError = 14,
+    ProhibitedSyscall = 15,
+    PermissionDenied = 16,
+    OutOfMemory = 17,
+}
+
+impl Abort {
+    pub fn abort(self, msg: &str) -> ! {
+        let code = self as i32;
+        let msg = format!("({}): {}", code, msg);
+        if self == Abort::Clean {
+            info!("{}", msg);
+        } else {
+            warn!("{}", msg);
+        }
+        eprintln!("{}", msg);
+        let mut lock = LOG_CONN.lock().unwrap();
+        if let Some(socket) = &mut *lock {
+            socket.flush().ok();
+        }
+        // run drop handler
+        let _ = lock.take();
+        // hold lock until exit
+        std::process::exit(code);
     }
 }
 
@@ -422,197 +541,38 @@ enum SyslogSeverity {
     Notice = 5,
     Informational = 6,
     Debug = 7,
+    Trace = 8, // not a valid syslog value
 }
 
-static TLS_CONF: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
-    fn root_certs() -> rustls::RootCertStore {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
-        root_store
-    }
-
-    let config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_certs())
-        .with_no_client_auth();
-
-    Arc::new(config)
-});
-static SOCKET: Lazy<Mutex<Option<Socket>>> = Lazy::new(|| Mutex::new(None));
-
-#[allow(clippy::large_enum_variant)]
-enum Socket {
-    Tls(StreamOwned<ClientConnection, TcpStream>),
-    Raw(TcpStream),
-    Void,
-}
-
-use std::io;
-
-impl Write for Socket {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Socket::Tls(v) => v.write(buf),
-            Socket::Raw(v) => v.write(buf),
-            Socket::Void => Ok(buf.len()),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Socket::Tls(v) => v.flush(),
-            Socket::Raw(v) => v.flush(),
-            Socket::Void => Ok(()),
-        }
-    }
-}
-
-fn do_log(mut l: LogBuilder) {
-    //
-    // In memory-log retention is always DEBUG level and above.
-    if l.level.as_u8() <= Level::Debug.as_u8() {
-        //
-        // only if there is a retention id.
-        if let Some(recording_id) = l.retention_id.take() {
-            let mut lock = LOG_RETAIN.lock().unwrap();
-
-            lock.add_row(recording_id, &l);
-        }
-    }
-
-    // All other obey conf.
-    if l.level.as_u8() > l.conf.min_level.as_u8() {
-        return;
-    }
-
-    // do print all enabled levels locally.
-    if !l.conf.use_syslog() {
-        eprintln!("{}", l);
-        return;
-    }
-
-    // don't send on stuff without severity
-    if l.level.severity().is_none() {
-        return;
-    }
-
-    let mut lock = SOCKET.lock().unwrap();
-
-    let mut attempts = 3;
-
-    loop {
-        attempts -= 1;
-        if attempts == 0 {
-            // give up
-            eprintln!("{}", l);
-            break;
-        }
-        if lock.is_none() {
-            match connect_host(&l.conf.log_host, l.conf.log_port) {
-                Ok(tcp) => {
-                    let sock = if l.conf.use_tls {
-                        let name = l
-                            .conf
-                            .log_host
-                            .as_str()
-                            .try_into()
-                            .expect("SNI server name");
-                        let sess = rustls::ClientConnection::new(TLS_CONF.clone(), name)
-                            .expect("rustls client conn");
-                        Socket::Tls(StreamOwned::new(sess, tcp))
-                    } else {
-                        Socket::Raw(tcp)
-                    };
-                    *lock = Some(sock);
-                }
-                Err(_) => {
-                    // try again
-                    *lock = None;
-                    continue;
-                }
+impl fmt::Display for SyslogSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                SyslogSeverity::Emergency => "EMERG",
+                SyslogSeverity::Alert => "ALERT",
+                SyslogSeverity::Critical => "CRIT",
+                SyslogSeverity::Error => "ERROR",
+                SyslogSeverity::Warning => "WARN",
+                SyslogSeverity::Notice => "NOTICE",
+                SyslogSeverity::Informational => "INFO",
+                SyslogSeverity::Debug => "DEBUG",
+                SyslogSeverity::Trace => "TRACE",
             }
-        }
-
-        // we got a connection
-        let row = format!("{}", l.to_syslog());
-        let to_send = &row.into_bytes()[..];
-        match lock.as_mut().unwrap().write_all(to_send) {
-            Ok(_) => break, // success
-            Err(_) => {
-                // failed to send, try to reinstate a new socket
-                *lock = None;
-            }
-        }
+        )
     }
-}
-
-use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
-use std::time::Duration;
-
-fn connect_host(hostname: &str, port: u16) -> Result<TcpStream, LologError> {
-    //
-    let ips: Vec<SocketAddr> = format!("{}:{}", hostname, port)
-        .to_socket_addrs()
-        .map_err(|e| LologError::new(500, &format!("DNS lookup failed ({}): {}", hostname, e)))?
-        .collect();
-
-    if ips.is_empty() {
-        return Err(LologError::new(
-            500,
-            &format!("No ip address for {}", hostname),
-        ));
-    }
-
-    // pick first ip, or should we randomize?
-    let sock_addr = ips[0];
-
-    // connect with a configured timeout.
-    let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(5_000))
-        .map_err(|err| LologError::new(500, &format!("{}", err)))?;
-
-    stream
-        .set_read_timeout(Some(Duration::from_millis(10_000)))
-        .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_millis(15_000)))
-        .ok();
-
-    Ok(stream)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SyslogMessage<'a> {
-    facility: SyslogFacility,
-    severity: SyslogSeverity,
-    timestamp: &'a SystemTime,
-    hostname: &'a str,
-    app_name: &'a str,
-    pid: &'a str,
-    msg_id: String,
-    api_key_id: &'a str,
-    api_key: &'a str,
-    env: &'a str,
-    message: String,
 }
 
 /// Format as a syslog row.
-impl<'a> fmt::Display for SyslogMessage<'a> {
+#[allow(clippy::write_with_newline)]
+impl fmt::Display for LogRecord {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let pri = (self.facility as u8) * 8 + (self.severity as u8);
-        let dt: DateTime<Utc> = self.timestamp.clone().into();
+        let pri = (*self.facility as u8) * 8 + (self.severity as u8);
+
         // 2019-03-18T13:12:27.000+00:00
-        let time = dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
-        let newline = if self.message.ends_with('\n') {
-            ""
-        } else {
-            "\n"
-        };
+        let time = self.timestamp.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
+
         // 53595 is an private enterprise number (PEN) for Lookback
         // as assigned by IANA. https://www.iana.org/assignments/enterprise-numbers
         // we applied for it here:
@@ -621,201 +581,115 @@ impl<'a> fmt::Display for SyslogMessage<'a> {
             "[{}@53595 apiKey=\"{}\" env=\"{}\"]",
             self.api_key_id, self.api_key, self.env
         );
+
+        let mut message = self
+            .message
+            .as_deref()
+            .map(|s| s.trim())
+            .unwrap_or("")
+            .to_owned();
+
+        if let Some(w) = &self.well_known {
+            let s = serde_json::to_string(&w).expect("Json serialize");
+            message.push(' ');
+            message.push_str(&s);
+        }
+
+        // replace any char < 32 with a space.
+        fn strip_ctrl(s: &str) -> String {
+            s.chars()
+                .map(|c| match c {
+                    '\x00'..='\x1f' => ' ',
+                    _ => c,
+                })
+                .collect()
+        }
+
+        message = strip_ctrl(&message);
+
+        fn chk(s: &str) -> &str {
+            if s.is_empty() {
+                "-"
+            } else {
+                s
+            }
+        }
+
         write!(
             f,
-            "<{}>1 {} {} {} {} {} {} {}{}",
+            "<{}>1 {} {} {} {} {} {} {}\n",
             pri,
             time,
-            chk(self.hostname),
-            chk(self.app_name),
-            chk(self.pid),
+            chk(&*self.hostname),
+            chk(&*self.app_name),
+            self.pid,
             chk(&self.msg_id),
             strct,
-            chk(&self.message),
-            newline
+            chk(&message),
         )
     }
 }
 
-fn chk(s: &str) -> &str {
-    if s.is_empty() {
-        "-"
-    } else {
-        s
+trait DateFormat {
+    fn format(&self, fmt: &'static str) -> String;
+}
+
+impl DateFormat for DateTime<Utc> {
+    fn format(&self, fmt: &'static str) -> String {
+        self.format(fmt).to_string()
     }
 }
 
-struct SimpleLogger;
-
-impl ::log::Log for SimpleLogger {
-    fn enabled(&self, metadata: &::log::Metadata) -> bool {
-        let conf = LOG_CONF.lock().unwrap();
-        metadata.target().starts_with(&conf.app_name)
-            || conf
-                .additional_log
-                .iter()
-                .any(|ns| metadata.target().starts_with(ns))
-    }
-
-    fn log(&self, record: &::log::Record) {
-        if self.enabled(record.metadata()) {
-            log(
-                match record.level() {
-                    ::log::Level::Trace => Level::Trace,
-                    ::log::Level::Debug => Level::Debug,
-                    ::log::Level::Info => Level::Info,
-                    ::log::Level::Warn => Level::Warn,
-                    ::log::Level::Error => Level::Error,
-                },
-                &format!("{}", record.args()),
-            )
-            .send();
-        }
-    }
-
-    fn flush(&self) {}
+#[derive(Debug)]
+pub enum Error {
+    Io(io::Error),
+    Tls(rustls::Error),
+    Dns(InvalidDnsNameError),
 }
 
-/// Exit process helper.
-///
-/// Standardized codes: https://www.notion.so/lookback/2883ab4e80914944b25a065154c554dd?v=66e7cb924934474aae5996448a870367
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum Abort {
-    MissingEnvVar,
-    UncaughtException,
-    DatabaseError,
-    LoggingError,
-    SideboatInitError,
-    ProhibitedSyscall,
-    PermissionDenied,
-    OutOfMemory,
-}
-
-impl Abort {
-    pub fn code(&self) -> i32 {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Abort::MissingEnvVar => 10,
-            Abort::UncaughtException => 11,
-            Abort::DatabaseError => 12,
-            Abort::LoggingError => 13,
-            Abort::SideboatInitError => 14,
-            Abort::ProhibitedSyscall => 15,
-            Abort::PermissionDenied => 16,
-            Abort::OutOfMemory => 17,
-        }
-    }
-
-    pub fn abort(&self, msg: &str) -> ! {
-        let msg = format!("({}): {}", self.code(), msg);
-        println!("{}", msg);
-        warn!("{}", msg);
-        // close socket
-        {
-            let mut lock = SOCKET.lock().unwrap();
-            if let Some(socket) = &mut *lock {
-                socket.flush().ok();
-                *socket = Socket::Void;
-            }
-        }
-        // allow logging message to be sent
-        std::thread::sleep(Duration::from_secs(2));
-        std::process::exit(self.code());
-    }
-}
-
-pub fn flush() {
-    let mut lock = SOCKET.lock().unwrap();
-    if let Some(socket) = &mut *lock {
-        socket.flush().ok();
-    }
-}
-
-use ::log::LevelFilter;
-
-static LOGGER: SimpleLogger = SimpleLogger;
-
-/// Configure the logger by providing the conf for it.
-pub fn setup_logger(conf: LogConf) {
-    {
-        let mut lock = LOG_CONF.lock().unwrap();
-        *lock = Arc::new(conf);
-    }
-
-    static INIT: ::std::sync::Once = ::std::sync::Once::new();
-    INIT.call_once(|| {
-        ::log::set_logger(&LOGGER)
-            .map(|()| ::log::set_max_level(LevelFilter::Trace))
-            .expect("Failed to set logger")
-    });
-}
-
-#[derive(Debug, Clone)]
-struct LologError {
-    code: u16,
-    message: String,
-}
-
-impl LologError {
-    fn new(code: u16, message: &str) -> Self {
-        LologError {
-            code,
-            message: message.into(),
+            Error::Io(e) => write!(f, "{}", e),
+            Error::Tls(e) => write!(f, "{}", e),
+            Error::Dns(e) => write!(f, "{}", e),
         }
     }
 }
 
-impl std::fmt::Display for LologError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Tls(e) => Some(e),
+            Error::Dns(e) => Some(e),
+        }
     }
 }
 
-impl std::error::Error for LologError {}
-
-/// Create a log builder for the TRACE level.
-#[macro_export]
-macro_rules! xtrace {
-    ($($arg:tt)*) => (
-        ::lolog::log(::lolog::Level::Trace, &format!($($arg)*));
-    )
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Io(e)
+    }
 }
 
-/// Create a log builder for the DEBUG level.
-#[macro_export]
-macro_rules! xdebug {
-    ($($arg:tt)*) => (
-        ::lolog::log(::lolog::Level::Debug, &format!($($arg)*));
-    )
+impl From<rustls::Error> for Error {
+    fn from(e: rustls::Error) -> Self {
+        Error::Tls(e)
+    }
 }
 
-/// Create a log builder for the INFO level.
-#[macro_export]
-macro_rules! xinfo {
-    ($($arg:tt)*) => (
-        ::lolog::log(::lolog::Level::Info, &format!($($arg)*));
-    )
-}
-
-/// Create a log builder for the WARN level.
-#[macro_export]
-macro_rules! xwarn {
-    ($($arg:tt)*) => (
-        ::lolog::log(::lolog::Level::Warn, &format!($($arg)*));
-    )
-}
-
-/// Create a log builder for the ERROR level.
-#[macro_export]
-macro_rules! xerror {
-    ($($arg:tt)*) => (
-        ::lolog::log(::lolog::Level::Error, &format!($($arg)*));
-    )
+impl From<InvalidDnsNameError> for Error {
+    fn from(e: InvalidDnsNameError) -> Self {
+        Error::Dns(e)
+    }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
+    use chrono::NaiveDateTime;
+
     use super::*;
-    use std::time::{Duration, UNIX_EPOCH};
 
     #[derive(Serialize, Debug, Clone, PartialEq, Eq, Default)]
     struct RandomStuff {
@@ -823,71 +697,47 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_ctrl() {
-        assert_eq!(strip_ctrl("foo\nbar"), "foo bar");
-    }
+    fn translate_syslog() {
+        let mut data = Map::new();
+        data.insert(
+            "extra".into(),
+            serde_json::to_value(&RandomStuff { stuff: 42 }).unwrap(),
+        );
 
-    #[test]
-    fn test_translate_syslog() {
-        setup_logger(LogConf {
-            hostname: "my-host".into(),
-            api_key: "secret stuffz".into(),
-            app_name: "fumar".into(),
-            app_version: "1.2.3".into(),
+        let well_known = WellKnown {
+            recordingId: Some("abc123".into()),
+            userId: Some("martin".into()),
+            sessionId: Some("my session".into()),
+            data: Some(data),
             ..Default::default()
-        });
-        ::std::env::set_var("SYSLOG_API_KEY", "secret stuffz");
-        let now = UNIX_EPOCH + Duration::from_secs(1_552_914_747);
-        let build = log(Level::Info, "Hello world!")
-            .timestamp(now)
-            .recording_id("abc123")
-            .user_id("martin")
-            .session_id("my session")
-            .data(&RandomStuff { stuff: 42 })
-            .use_uuid(false);
-        let row = format!("{}", build.to_syslog());
+        };
+
+        let n = NaiveDateTime::from_timestamp(1632152181, 392_000_000);
+
+        let rec = LogRecord {
+            facility: Arc::new(SyslogFacility::Local1),
+            hostname: Arc::new("my-host".to_string()),
+            app_name: Arc::new("fumar".to_string()),
+            pid: 123,
+            api_key_id: Arc::new("apikey".to_string()),
+            api_key: Arc::new("secret stuffz".to_string()),
+            env: Arc::new("development".to_string()),
+
+            severity: SyslogSeverity::Informational,
+            msg_id: "msgid".to_string(),
+
+            timestamp: DateTime::from_utc(n, Utc),
+            message: Some("Hello world!".to_string()),
+            well_known: Some(well_known),
+        };
+
+        let row = format!("{}", rec);
         assert_eq!(
             row,
-            "<142>1 2019-03-18T13:12:27.000+00:00 my-host fumar \
-             1.2.3 - [fumar@53595 apiKey=\"secret stuffz\" env=\"development\"] \
+            "<142>1 2021-09-20T15:36:21.392+00:00 my-host fumar \
+            123 msgid [apikey@53595 apiKey=\"secret stuffz\" env=\"development\"] \
              Hello world! {\"recordingId\":\"abc123\",\"userId\":\"martin\",\
-             \"sessionId\":\"my session\",\"data\":{\"stuff\":42}}\n"
+             \"sessionId\":\"my session\",\"data\":{\"extra\":{\"stuff\":42}}}\n"
         );
     }
-}
-
-struct LogRetain {
-    retained: HashMap<String, Vec<String>>,
-}
-
-impl LogRetain {
-    fn new() -> Self {
-        LogRetain {
-            retained: HashMap::new(),
-        }
-    }
-
-    fn add_row(&mut self, retention_id: String, l: &LogBuilder) {
-        let rows = self.retained.entry(retention_id).or_insert_with(Vec::new);
-
-        rows.push(format!("{}", l));
-    }
-}
-
-/// Obtain the retained rows for a given retention_id. Empty array if no such rows.
-pub fn retain_obtain<F: FnOnce(&Vec<String>)>(retention_id: &str, f: F) {
-    let lock = LOG_RETAIN.lock().unwrap();
-    if let Some(v) = lock.retained.get(retention_id) {
-        f(v);
-    } else {
-        let v = Vec::with_capacity(0);
-        f(&v);
-    }
-}
-
-/// Discard retained rows for a given retention_id.
-pub fn retain_discard(retention_id: &str) {
-    let mut lock = LOG_RETAIN.lock().unwrap();
-
-    lock.retained.remove(retention_id);
 }
