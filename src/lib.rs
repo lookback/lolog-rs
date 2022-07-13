@@ -202,6 +202,10 @@ where
         let mut add_field_visitor = visitor::AdditionalFieldVisitor::new(&mut json);
         event.record(&mut add_field_visitor);
 
+        if let Some(subsys) = json.remove("subsys") {
+            record.app_name = Arc::new(format!("{}.{}", self.config.app_name, subsys.as_string()));
+        }
+
         trait ToStr {
             fn as_string(&self) -> String;
         }
@@ -378,10 +382,12 @@ fn handle_log_record(log_host: &str, log_port: u16, r: LogRecord) {
     // that we want to send to the log host. An alternative would be to implement a direct
     // config option like "disable_console".
     let send_to_host = !r.api_key.is_empty();
+    // Don't log telemetry
+    let should_log = !r.app_name.ends_with(".telemetry");
 
     // don't log to console when we are sending to host, this to avoid double logging when
     // deployed in frontloader which also forwards console to the log servers.
-    if !send_to_host {
+    if !send_to_host && should_log {
         let row_color = format!(
             "{} {}  {} {}",
             r.timestamp.format("%H:%M:%S%.3f"),
