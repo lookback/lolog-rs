@@ -255,6 +255,18 @@ where
                 ..Default::default()
             };
 
+            // TODO: Explore using `tracing`'s `Valuable` trait instead of this when it becomes
+            // stable.
+            if let Some(Value::String(raw_json)) = json.remove("json") {
+                let parse_result = serde_json::from_str(&raw_json);
+
+                if let Ok(Value::Object(parsed_json_object)) = parse_result {
+                    // If there's a "json" field we expect it to be a serailized JSON object.
+                    // We merge this object into the structured data that we include in syslog
+                    json.merge_into(&parsed_json_object);
+                }
+            }
+
             // Rest is data
             if !json.is_empty() {
                 wk.data = Some(json);
@@ -688,6 +700,26 @@ impl From<rustls::Error> for Error {
 impl From<InvalidDnsNameError> for Error {
     fn from(e: InvalidDnsNameError) -> Self {
         Error::Dns(e)
+    }
+}
+
+trait MergeMap {
+    fn merge_into(&mut self, other: &Self);
+}
+
+impl MergeMap for Map<String, Value> {
+    /// Merge one map into another.
+    ///
+    /// Keys in the second argument overwrite those in the first.
+    /// NB: This isn't recursive
+    fn merge_into(&mut self, other: &Self) {
+        for (key, value) in other.iter() {
+            self.entry(key)
+                .and_modify(|e| {
+                    *e = value.clone();
+                })
+                .or_insert(value.clone());
+        }
     }
 }
 
