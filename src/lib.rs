@@ -812,9 +812,9 @@ mod util {
             let LoggedTimeout { label, start, name } = self;
             let duration = Instant::now().duration_since(*start);
 
-            if duration > Duration::from_millis(1) {
+            if duration > Duration::from_micros(500) {
                 eprintln!(
-                    "[{label}] {name} exceeded time threshold 1ms, took {:.2}µs",
+                    "[{label}] {name} exceeded time threshold 500µs, took {:.2}µs",
                     duration.as_secs_f64() * 10_f64.powf(6.0)
                 )
             }
