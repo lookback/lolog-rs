@@ -377,6 +377,7 @@ static LOG_CONN: Lazy<Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>> =
 fn handle_log_record(log_host: &str, log_port: u16, r: LogRecord) {
     use colorful::Color;
     use colorful::Colorful;
+    let _t = util::LoggedTimeout::start("handle_log_record", &"send");
 
     let color = {
         use SyslogSeverity::*;
@@ -777,5 +778,60 @@ mod test {
              Hello world! {\"recordingId\":\"abc123\",\"userId\":\"martin\",\
              \"sessionId\":\"my session\",\"data\":{\"extra\":{\"stuff\":42}}}\n"
         );
+    }
+}
+
+mod util {
+    use std::time::{Duration, Instant};
+
+    /// A timeout that logs if it exists for longer than 1ms.
+    ///
+    /// Useful to ensure we don't spend too much time in each iteration of hot loops or critical tokio
+    /// tasks.
+    pub struct LoggedTimeout {
+        start: Instant,
+        label: &'static str,
+        name: &'static str,
+    }
+
+    impl LoggedTimeout {
+        /// Start measuring.
+        ///
+        /// A log line is emitted on drop if the threshold(1ms) was exceeded.
+        pub fn start(label: &'static str, value: &impl Named) -> Self {
+            Self {
+                start: Instant::now(),
+                label,
+                name: value.name(),
+            }
+        }
+    }
+
+    impl Drop for LoggedTimeout {
+        fn drop(&mut self) {
+            let LoggedTimeout { label, start, name } = self;
+            let duration = Instant::now().duration_since(*start);
+
+            if duration > Duration::from_millis(1) {
+                eprintln!(
+                    "[{label}] {name} exceeded time threshold 1ms, took {:.2}µs",
+                    duration.as_secs_f64() * 10_f64.powf(6.0)
+                )
+            }
+        }
+    }
+
+    /// Something named.
+    ///
+    /// `Display` requires allocating a [`String`] so this exists as an alternative when we don't want
+    /// to allocate.
+    pub trait Named {
+        fn name(&self) -> &'static str;
+    }
+
+    impl Named for &'static str {
+        fn name(&self) -> &'static str {
+            *self
+        }
     }
 }
