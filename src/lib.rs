@@ -9,8 +9,8 @@ use std::{env, fmt, process};
 
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
-use rustls::client::InvalidDnsNameError;
-use rustls::{ClientConfig, ClientConnection, OwnedTrustAnchor, RootCertStore, StreamOwned};
+use rustls::pki_types::{InvalidDnsNameError, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::span::Attributes;
@@ -473,21 +473,18 @@ fn connect(
     let sock = TcpStream::connect(&addr)?;
 
     let mut root_store = RootCertStore::empty();
-    root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-        OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
+    root_store.extend(
+        webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .map(|ta| ta.to_owned()),
+    );
 
     let tls_config = ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    let server_name = log_host.try_into()?;
-    let conn = ClientConnection::new(Arc::new(tls_config), server_name)?;
+    let server_name: ServerName = log_host.try_into()?;
+    let conn = ClientConnection::new(Arc::new(tls_config), server_name.to_owned())?;
 
     let stream = StreamOwned::new(conn, sock);
 
