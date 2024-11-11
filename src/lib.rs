@@ -645,16 +645,6 @@ impl fmt::Display for LogRecord {
     }
 }
 
-trait DateFormat {
-    fn format(&self, fmt: &'static str) -> String;
-}
-
-impl DateFormat for DateTime<Utc> {
-    fn format(&self, fmt: &'static str) -> String {
-        self.format(fmt).to_string()
-    }
-}
-
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -747,6 +737,7 @@ mod test {
             ..Default::default()
         };
 
+        #[allow(deprecated)]
         let n = NaiveDateTime::from_timestamp(1632152181, 392_000_000);
 
         let rec = LogRecord {
@@ -761,6 +752,7 @@ mod test {
             severity: SyslogSeverity::Informational,
             msg_id: "msgid".to_string(),
 
+            #[allow(deprecated)]
             timestamp: DateTime::from_utc(n, Utc),
             message: Some("Hello world!".to_string()),
             well_known: Some(well_known),
