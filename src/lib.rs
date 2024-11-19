@@ -1,16 +1,14 @@
 #[macro_use]
 extern crate tracing;
 
-use std::convert::TryInto;
-use std::io::{self, Write};
-use std::net::TcpStream;
+use std::ffi::NulError;
+use std::io::{self};
 use std::sync::{Arc, Mutex};
 use std::{env, fmt, process};
 
+use backend::Backend;
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
-use rustls::pki_types::{InvalidDnsNameError, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::pki_types::InvalidDnsNameError;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::span::Attributes;
@@ -20,6 +18,7 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{prelude::*, registry::LookupSpan};
 
+mod backend;
 mod visitor;
 
 pub struct LogConfig {
@@ -34,16 +33,56 @@ pub struct LogConfig {
     pub pid: u32,
     /// Application version string.
     pub app_version: String,
-    /// API key id for the api key
-    pub api_key_id: String,
-    /// API key for loggin to our syslog server.
-    pub api_key: String,
-    /// Name of host to connect and deliver log messages to.
-    pub log_host: String,
-    /// Port on host to deliver log messages to.
-    pub log_port: u16,
-    /// Whether we are to use TLS for logging.
-    pub use_tls: bool,
+    /// Backend configuration
+    pub backend: Option<BackendConfig>,
+}
+
+/// Configuration for logging backend
+pub enum BackendConfig {
+    /// Log over the network against a server that implements the TCP protocol.
+    Network(NetworkConfig),
+    /// Log using a system logger.
+    System {},
+}
+
+impl BackendConfig {
+    pub fn as_network_mut(&mut self) -> Option<&mut NetworkConfig> {
+        match self {
+            BackendConfig::Network(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+}
+
+pub struct NetworkConfig {
+    host: String,
+    port: u16,
+    api_key: String,
+    api_key_id: String,
+    use_tls: bool,
+}
+
+impl NetworkConfig {
+    fn from_env() -> Self {
+        let host = env::var("SYSLOG_HOST").unwrap_or_else(|_| "logrelay.lookback.io".to_string());
+        let port = env::var("SYSLOG_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6514);
+        let use_tls = env::var("SYSLOG_TLS")
+            .map(|x| x == "1" || x == "true")
+            .unwrap_or(false);
+        let api_key_id = env::var("SYSLOG_API_KEY_ID").unwrap_or_else(|_| "".into());
+        let api_key = env::var("SYSLOG_API_KEY").unwrap_or_else(|_| "".into());
+
+        Self {
+            host,
+            port,
+            api_key,
+            api_key_id,
+            use_tls,
+        }
+    }
 }
 
 impl Default for LogConfig {
@@ -58,20 +97,18 @@ impl Default for LogConfig {
             pid: process::id(),
             app_name: "<app name>".into(),
             app_version: "<app version>".into(),
-            api_key_id: env::var("SYSLOG_API_KEY_ID").unwrap_or_else(|_| "".into()),
-            api_key: env::var("SYSLOG_API_KEY").unwrap_or_else(|_| "".into()),
-            log_host: env::var("SYSLOG_HOST")
-                .unwrap_or_else(|_| "logrelay.lookback.io".to_string()),
-            log_port: env::var("SYSLOG_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(6514),
-            use_tls: env::var("SYSLOG_TLS")
-                .map(|x| x == "1" || x == "true")
-                .unwrap_or(false),
+            backend: Some(BackendConfig::default()),
         }
     }
 }
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self::Network(NetworkConfig::from_env())
+    }
+}
+
+static BACKEND_SINGLETON: Mutex<Option<Backend>> = Mutex::new(None);
 
 /// Logging implementation for tracing crate.
 pub struct Logger {
@@ -79,12 +116,11 @@ pub struct Logger {
     config: Arc<LogConfig>,
     /// Base record with fields that don't change.
     base_record: Arc<LogRecord>,
+    backend: Option<Backend>,
 }
 
 impl Logger {
     pub fn init(config: LogConfig) -> Result<(), Error> {
-        assert!(config.use_tls, "Must use TLS for logging");
-
         let config = Arc::new(config);
 
         let base_record = Arc::new(LogRecord {
@@ -92,12 +128,6 @@ impl Logger {
             hostname: Arc::new(config.hostname.clone()),
             app_name: Arc::new(config.app_name.clone()),
             pid: config.pid,
-            api_key_id: Arc::new(if config.api_key_id.is_empty() {
-                config.app_name.clone()
-            } else {
-                config.api_key_id.clone()
-            }),
-            api_key: Arc::new(config.api_key.clone()),
             env: Arc::new(config.env.clone()),
 
             severity: SyslogSeverity::Informational,
@@ -106,10 +136,44 @@ impl Logger {
             message: None,
             well_known: None,
         });
+        let backend = match &config.backend {
+            None => None,
+            Some(BackendConfig::Network(NetworkConfig {
+                host,
+                port,
+                api_key_id,
+                api_key,
+                use_tls,
+            })) => {
+                assert!(use_tls, "TLS must be used");
+                let id = if api_key_id.is_empty() {
+                    config.app_name.clone()
+                } else {
+                    api_key_id.clone()
+                };
+
+                Some(Backend::network(host.clone(), *port, id, api_key.clone()))
+            }
+            Some(BackendConfig::System {}) => {
+                let backend = Backend::system()?;
+                Some(backend)
+            }
+        };
+
+        if let Some(backend) = &backend {
+            let mut lock = BACKEND_SINGLETON.lock().unwrap();
+            assert!(
+                lock.is_none(),
+                "Logger with backend can only be initialized once"
+            );
+
+            *lock = Some(backend.clone());
+        }
 
         let logger = Logger {
             config,
             base_record,
+            backend,
         };
 
         // Compose our logger layer with the "EnvFilter" which is set via
@@ -275,9 +339,7 @@ where
             record.well_known = Some(wk);
         }
 
-        let log_host = self.config.log_host.as_str();
-        let log_port = self.config.log_port;
-        handle_log_record(log_host, log_port, record);
+        handle_log_record(record, self.backend.as_ref());
     }
 }
 
@@ -287,8 +349,6 @@ struct LogRecord {
     hostname: Arc<String>,
     app_name: Arc<String>,
     pid: u32,
-    api_key_id: Arc<String>,
-    api_key: Arc<String>,
     env: Arc<String>,
 
     severity: SyslogSeverity,
@@ -369,12 +429,8 @@ impl WellKnown {
     }
 }
 
-// singleton log connection.
-static LOG_CONN: Lazy<Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>> =
-    Lazy::new(|| Mutex::new(None));
-
 /// Send messages to log server
-fn handle_log_record(log_host: &str, log_port: u16, r: LogRecord) {
+fn handle_log_record(r: LogRecord, backend: Option<&Backend>) {
     use colorful::Color;
     use colorful::Colorful;
 
@@ -393,13 +449,13 @@ fn handle_log_record(log_host: &str, log_port: u16, r: LogRecord) {
     // The SYSLOG_API_KEY env var goes into this field, and is the best implicit way to detect
     // that we want to send to the log host. An alternative would be to implement a direct
     // config option like "disable_console".
-    let send_to_host = !r.api_key.is_empty();
+    let send_to_backend = backend.map(|b| b.active()).unwrap_or(false);
     // Don't log telemetry
     let should_log = !r.app_name.ends_with(".telemetry");
 
     // don't log to console when we are sending to host, this to avoid double logging when
     // deployed in frontloader which also forwards console to the log servers.
-    if !send_to_host && should_log {
+    if !send_to_backend && should_log {
         let row_color = format!(
             "{} {}  {} {}",
             r.timestamp.format("%H:%M:%S%.3f"),
@@ -422,73 +478,9 @@ fn handle_log_record(log_host: &str, log_port: u16, r: LogRecord) {
         return;
     }
 
-    let mut log_conn = LOG_CONN.lock().unwrap();
-
-    // reconnect loop
-    loop {
-        // Connect up TLS connection to log server.
-        if log_conn.is_none() {
-            match connect(log_host, log_port) {
-                Ok(v) => {
-                    *log_conn = Some(v);
-                }
-                Err(e) => {
-                    eprintln!("Failed to connect to log host: {:?}", e);
-
-                    // TODO: Do we need backoff here? Since the logging is sync, it
-                    // would lock up the callsite.
-
-                    continue;
-                }
-            }
-        }
-
-        let str = r.to_string();
-        let bytes = str.as_bytes();
-
-        let stream = log_conn.as_mut().expect("Existing log connection");
-
-        match stream.write_all(bytes).and_then(|_| stream.flush()) {
-            Ok(_) => {
-                // Log message sent successfully.
-                break;
-            }
-            Err(e) => {
-                eprintln!("Log connection failed: {:?}", e);
-
-                // Remove previous failed connection to trigger reconnect.
-                *log_conn = None;
-            }
-        }
+    if let Some(b) = backend {
+        b.log(&r);
     }
-}
-
-/// Connect a TLS connection to the log server.
-fn connect(
-    log_host: &str,
-    log_port: u16,
-) -> Result<StreamOwned<ClientConnection, TcpStream>, Error> {
-    let addr = format!("{}:{}", log_host, log_port);
-
-    let sock = TcpStream::connect(&addr)?;
-
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(
-        webpki_roots::TLS_SERVER_ROOTS
-            .iter()
-            .map(|ta| ta.to_owned()),
-    );
-
-    let tls_config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let server_name: ServerName = log_host.try_into()?;
-    let conn = ClientConnection::new(Arc::new(tls_config), server_name.to_owned())?;
-
-    let stream = StreamOwned::new(conn, sock);
-
-    Ok(stream)
 }
 
 ///
@@ -516,13 +508,14 @@ impl Abort {
             warn!("{}", msg);
         }
         eprintln!("{}", msg);
-        let mut lock = LOG_CONN.lock().unwrap();
-        if let Some(socket) = &mut *lock {
-            socket.flush().ok();
-        }
+        let mut lock = BACKEND_SINGLETON.lock().unwrap();
+        if let Some(backend) = &mut *lock {
+            backend.flush().ok();
+        };
         // run drop handler
         let _ = lock.take();
         // hold lock until exit
+
         std::process::exit(code);
     }
 }
@@ -579,77 +572,12 @@ impl fmt::Display for SyslogSeverity {
     }
 }
 
-/// Format as a syslog row.
-#[allow(clippy::write_with_newline)]
-impl fmt::Display for LogRecord {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let pri = (*self.facility as u8) * 8 + (self.severity as u8);
-
-        // 2019-03-18T13:12:27.000+00:00
-        let time = self.timestamp.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
-
-        // 53595 is an private enterprise number (PEN) for Lookback
-        // as assigned by IANA. https://www.iana.org/assignments/enterprise-numbers
-        // we applied for it here:
-        // https://pen.iana.org/pen/PenApplication.page
-        let strct = format!(
-            "[{}@53595 apiKey=\"{}\" env=\"{}\"]",
-            self.api_key_id, self.api_key, self.env
-        );
-
-        let mut message = self
-            .message
-            .as_deref()
-            .map(|s| s.trim())
-            .unwrap_or("")
-            .to_owned();
-
-        if let Some(w) = &self.well_known {
-            let s = serde_json::to_string(&w).expect("Json serialize");
-            message.push(' ');
-            message.push_str(&s);
-        }
-
-        // replace any char < 32 with a space.
-        fn strip_ctrl(s: &str) -> String {
-            s.chars()
-                .map(|c| match c {
-                    '\x00'..='\x1f' => ' ',
-                    _ => c,
-                })
-                .collect()
-        }
-
-        message = strip_ctrl(&message);
-
-        fn chk(s: &str) -> &str {
-            if s.is_empty() {
-                "-"
-            } else {
-                s
-            }
-        }
-
-        write!(
-            f,
-            "<{}>1 {} {} {} {} {} {} {}\n",
-            pri,
-            time,
-            chk(&*self.hostname),
-            chk(&*self.app_name),
-            self.pid,
-            chk(&self.msg_id),
-            strct,
-            chk(&message),
-        )
-    }
-}
-
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
     Tls(rustls::Error),
     Dns(InvalidDnsNameError),
+    NulError(NulError),
 }
 
 impl fmt::Display for Error {
@@ -658,6 +586,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "{}", e),
             Error::Tls(e) => write!(f, "{}", e),
             Error::Dns(e) => write!(f, "{}", e),
+            Error::NulError(e) => write!(f, "{}", e),
         }
     }
 }
@@ -668,6 +597,7 @@ impl std::error::Error for Error {
             Error::Io(e) => Some(e),
             Error::Tls(e) => Some(e),
             Error::Dns(e) => Some(e),
+            Error::NulError(e) => Some(e),
         }
     }
 }
@@ -690,6 +620,12 @@ impl From<InvalidDnsNameError> for Error {
     }
 }
 
+impl From<NulError> for Error {
+    fn from(e: NulError) -> Self {
+        Error::NulError(e)
+    }
+}
+
 trait MergeMap {
     fn merge_into(&mut self, other: &Self);
 }
@@ -707,64 +643,5 @@ impl MergeMap for Map<String, Value> {
                 })
                 .or_insert(value.clone());
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use chrono::NaiveDateTime;
-
-    use super::*;
-
-    #[derive(Serialize, Debug, Clone, PartialEq, Eq, Default)]
-    struct RandomStuff {
-        stuff: usize,
-    }
-
-    #[test]
-    fn translate_syslog() {
-        let mut data = Map::new();
-        data.insert(
-            "extra".into(),
-            serde_json::to_value(&RandomStuff { stuff: 42 }).unwrap(),
-        );
-
-        let well_known = WellKnown {
-            recordingId: Some("abc123".into()),
-            userId: Some("martin".into()),
-            sessionId: Some("my session".into()),
-            data: Some(data),
-            ..Default::default()
-        };
-
-        #[allow(deprecated)]
-        let n = NaiveDateTime::from_timestamp(1632152181, 392_000_000);
-
-        let rec = LogRecord {
-            facility: Arc::new(SyslogFacility::Local1),
-            hostname: Arc::new("my-host".to_string()),
-            app_name: Arc::new("fumar".to_string()),
-            pid: 123,
-            api_key_id: Arc::new("apikey".to_string()),
-            api_key: Arc::new("secret stuffz".to_string()),
-            env: Arc::new("development".to_string()),
-
-            severity: SyslogSeverity::Informational,
-            msg_id: "msgid".to_string(),
-
-            #[allow(deprecated)]
-            timestamp: DateTime::from_utc(n, Utc),
-            message: Some("Hello world!".to_string()),
-            well_known: Some(well_known),
-        };
-
-        let row = format!("{}", rec);
-        assert_eq!(
-            row,
-            "<142>1 2021-09-20T15:36:21.392+00:00 my-host fumar \
-            123 msgid [apikey@53595 apiKey=\"secret stuffz\" env=\"development\"] \
-             Hello world! {\"recordingId\":\"abc123\",\"userId\":\"martin\",\
-             \"sessionId\":\"my session\",\"data\":{\"extra\":{\"stuff\":42}}}\n"
-        );
     }
 }
