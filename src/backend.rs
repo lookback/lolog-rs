@@ -177,7 +177,7 @@ mod network {
     ) {
         let pri = (*record.facility as u8) * 8 + (record.severity as u8);
         // 2019-03-18T13:12:27.000+00:00
-        let time = record.timestamp.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
+        let time = record.timestamp.strftime("%Y-%m-%dT%H:%M:%S%.3f%:z");
         let message = StripCtrl::new(chk(record
             .message
             .as_deref()
@@ -356,7 +356,6 @@ mod tests {
     }
 
     mod network_tests {
-        use chrono::TimeZone as _;
 
         use crate::{SyslogFacility, SyslogSeverity};
 
@@ -368,7 +367,7 @@ mod tests {
             let record = LogRecord {
                 facility: SyslogFacility::Local0.into(),
                 severity: SyslogSeverity::Warning,
-                timestamp: chrono::Utc.ymd(2021, 3, 18).and_hms_milli(13, 12, 27, 0),
+                timestamp: "2021-03-18T13:12:27.000+00:00".parse().unwrap(),
                 hostname: "localhost".to_string().into(),
                 app_name: "test".to_string().into(),
                 pid: 1234,
