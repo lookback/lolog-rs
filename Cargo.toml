@@ -8,10 +8,10 @@ edition = "2021"
 tokio_console = ["console-subscriber"]
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
 colorful = "0.3"
 console-subscriber = { version = "0.4", optional = true }
 hostname = "0.4"
+jiff = "0.1.29"
 # We don't want aws-lc-rs, typically a library should leave the backend choice up to the consumer, but we want to be opinionated here.
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 serde = { version = "1", features = ["std", "rc", "derive"] }
