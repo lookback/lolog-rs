@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use crate::{Error, LogRecord};
@@ -52,6 +53,7 @@ impl Backend {
 mod network {
     use std::io::Write;
     use std::net::TcpStream;
+    use std::ops::DerefMut;
     use std::sync::{Arc, Mutex};
 
     use rustls::pki_types::ServerName;
@@ -59,8 +61,10 @@ mod network {
 
     use crate::{Error, LogRecord};
 
+    use super::{chk, StripCtrl};
+
     pub struct Network {
-        conn: Mutex<Option<StreamOwned<ClientConnection, TcpStream>>>,
+        conn: Mutex<(Option<StreamOwned<ClientConnection, TcpStream>>, Vec<u8>)>,
         api_key: String,
         api_key_id: String,
         host: String,
@@ -70,7 +74,7 @@ mod network {
     impl Network {
         pub fn new(host: String, port: u16, api_key_id: String, api_key: String) -> Self {
             Self {
-                conn: Mutex::new(None),
+                conn: Mutex::new((None, vec![])),
                 api_key,
                 api_key_id,
                 host,
@@ -83,7 +87,8 @@ mod network {
         }
 
         pub(super) fn log(&self, record: &crate::LogRecord) {
-            let mut log_conn = self.conn.lock().unwrap();
+            let mut log_conn_and_buf = self.conn.lock().unwrap();
+            let (log_conn, buf) = log_conn_and_buf.deref_mut();
 
             // reconnect loop
             loop {
@@ -104,12 +109,12 @@ mod network {
                     }
                 }
 
-                let str = self.log_record_to_string(record);
-                let bytes = str.as_bytes();
+                buf.clear();
+                format_log_record(record, &self.api_key, &self.api_key_id, buf);
 
                 let stream = log_conn.as_mut().expect("Existing log connection");
 
-                match stream.write_all(bytes).and_then(|_| stream.flush()) {
+                match stream.write_all(buf).and_then(|_| stream.flush()) {
                     Ok(_) => {
                         // Log message sent successfully.
                         break;
@@ -124,76 +129,9 @@ mod network {
             }
         }
 
-        fn log_record_to_string(&self, record: &LogRecord) -> String {
-            let mut res = String::new();
-
-            let pri = (*record.facility as u8) * 8 + (record.severity as u8);
-
-            // 2019-03-18T13:12:27.000+00:00
-            let time = record.timestamp.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
-
-            // 53595 is an private enterprise number (PEN) for Lookback
-            // as assigned by IANA. https://www.iana.org/assignments/enterprise-numbers
-            // we applied for it here:
-            // https://pen.iana.org/pen/PenApplication.page
-            let strct = format!(
-                "[{}@53595 apiKey=\"{}\" env=\"{}\"]",
-                self.api_key_id, self.api_key, record.env
-            );
-
-            let mut message = record
-                .message
-                .as_deref()
-                .map(|s| s.trim())
-                .unwrap_or("")
-                .to_owned();
-
-            if let Some(w) = &record.well_known {
-                let s = serde_json::to_string(&w).expect("Json serialize");
-                message.push(' ');
-                message.push_str(&s);
-            }
-
-            // replace any char < 32 with a space.
-            fn strip_ctrl(s: &str) -> String {
-                s.chars()
-                    .map(|c| match c {
-                        '\x00'..='\x1f' => ' ',
-                        _ => c,
-                    })
-                    .collect()
-            }
-
-            message = strip_ctrl(&message);
-
-            fn chk(s: &str) -> &str {
-                if s.is_empty() {
-                    "-"
-                } else {
-                    s
-                }
-            }
-
-            use std::fmt::Write;
-            let write_res = write!(
-                res,
-                "<{}>1 {} {} {} {} {} {} {}\n",
-                pri,
-                time,
-                chk(&*record.hostname),
-                chk(&*record.app_name),
-                record.pid,
-                chk(&record.msg_id),
-                strct,
-                chk(&message),
-            );
-            assert!(write_res.is_ok(), "Failed to write to string");
-
-            res
-        }
-
         pub(crate) fn flush(&self) -> Result<(), Error> {
-            let mut log_conn = self.conn.lock().unwrap();
+            let mut log_conn_and_buf = self.conn.lock().unwrap();
+            let (log_conn, _) = log_conn_and_buf.deref_mut();
 
             if let Some(stream) = log_conn.as_mut() {
                 stream.flush()?;
@@ -230,15 +168,55 @@ mod network {
 
         Ok(stream)
     }
+
+    pub(super) fn format_log_record(
+        record: &LogRecord,
+        api_key: &str,
+        api_key_id: &str,
+        res: &mut Vec<u8>,
+    ) {
+        let pri = (*record.facility as u8) * 8 + (record.severity as u8);
+        // 2019-03-18T13:12:27.000+00:00
+        let time = record.timestamp.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
+        let message = StripCtrl::new(chk(record
+            .message
+            .as_deref()
+            .map(|s| s.trim())
+            .unwrap_or("")));
+
+        write!(
+            res,
+            "<{}>1 {} {} {} {} {} {} {}",
+            pri,
+            time,
+            chk(&record.hostname),
+            chk(&record.app_name),
+            record.pid,
+            chk(&record.msg_id),
+            format_args!(
+                "[{}@53595 apiKey=\"{}\" env=\"{}\"]",
+                api_key_id, api_key, record.env
+            ),
+            message,
+        )
+        .expect("Write to string failed, out of memory?");
+
+        if let Some(w) = &record.well_known {
+            write!(res, " ").expect("Write to string failed, out of memory?");
+            serde_json::to_writer(&mut *res, w).expect("Json serialize");
+        }
+        write!(res, "\n").expect("Write to string failed, out of memory?");
+    }
 }
 
 mod system {
-    use std::fmt;
     use std::ops::DerefMut;
     use std::os::unix::net::UnixDatagram;
     use std::sync::Mutex;
 
     use crate::Error;
+
+    use super::{chk, StripCtrl};
 
     pub struct System {
         socket_and_buf: Mutex<(UnixDatagram, Vec<u8>)>,
@@ -272,7 +250,6 @@ mod system {
 
             write!(buf, r#"<{pri}>{app_name}[{pid}]: {msg}"#)
                 .expect("Write to buffer failed, out of memory?");
-
             if let Some(w) = &record.well_known {
                 write!(buf, " ").expect("Write to buffer, out of memory?");
                 serde_json::to_writer(&mut *buf, w).expect("JSON serialize");
@@ -320,50 +297,100 @@ mod system {
 
         Ok(socket)
     }
+}
 
-    struct StripCtrl<T>(T);
+struct StripCtrl<T>(T);
 
-    impl<T: fmt::Display> fmt::Display for StripCtrl<T> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            use fmt::Write;
-            // Custom writing mechanism that replaces control characters on-the-fly
-            struct ControlSanitizer<'a, 'b> {
-                formatter: &'a mut fmt::Formatter<'b>,
-            }
+impl<T: fmt::Display> fmt::Display for StripCtrl<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use fmt::Write;
+        // Custom writing mechanism that replaces control characters on-the-fly
+        struct ControlSanitizer<'a, 'b> {
+            formatter: &'a mut fmt::Formatter<'b>,
+        }
 
-            impl<'a, 'b> fmt::Write for ControlSanitizer<'a, 'b> {
-                fn write_str(&mut self, s: &str) -> fmt::Result {
-                    for c in s.chars() {
-                        self.formatter
-                            .write_char(if c.is_control() { ' ' } else { c })?;
-                    }
-
-                    Ok(())
-                }
-
-                fn write_char(&mut self, c: char) -> fmt::Result {
+        impl<'a, 'b> fmt::Write for ControlSanitizer<'a, 'b> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                for c in s.chars() {
                     self.formatter
-                        .write_char(if c.is_control() { ' ' } else { c })
+                        .write_char(if c.is_control() { ' ' } else { c })?;
                 }
+
+                Ok(())
             }
 
-            let mut sanitizer = ControlSanitizer { formatter: f };
-
-            write!(sanitizer, "{}", self.0)
+            fn write_char(&mut self, c: char) -> fmt::Result {
+                self.formatter
+                    .write_char(if c.is_control() { ' ' } else { c })
+            }
         }
+
+        let mut sanitizer = ControlSanitizer { formatter: f };
+
+        write!(sanitizer, "{}", self.0)
+    }
+}
+
+impl<T: fmt::Display> StripCtrl<T> {
+    fn new(value: T) -> Self {
+        StripCtrl(value)
+    }
+}
+fn chk(s: &str) -> &str {
+    if s.is_empty() {
+        "-"
+    } else {
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ctrl() {
+        let s = "Hello\x00World";
+        let stripped = StripCtrl::new(s);
+        assert_eq!(format!("{}", stripped), "Hello World");
     }
 
-    impl<T: fmt::Display> StripCtrl<T> {
-        fn new(value: T) -> Self {
-            StripCtrl(value)
-        }
-    }
+    mod network_tests {
+        use chrono::TimeZone as _;
 
-    fn chk(s: &str) -> &str {
-        if s.is_empty() {
-            "-"
-        } else {
-            s
+        use crate::{SyslogFacility, SyslogSeverity};
+
+        use super::network::*;
+        use super::*;
+
+        #[test]
+        fn test_format_log_record() {
+            let record = LogRecord {
+                facility: SyslogFacility::Local0.into(),
+                severity: SyslogSeverity::Warning,
+                timestamp: chrono::Utc.ymd(2021, 3, 18).and_hms_milli(13, 12, 27, 0),
+                hostname: "localhost".to_string().into(),
+                app_name: "test".to_string().into(),
+                pid: 1234,
+                msg_id: "4321".to_string(),
+                env: "test".to_string().into(),
+                message: Some("Hello, World!".to_string()),
+                well_known: Some(crate::WellKnown {
+                    recordingId: Some("evANFeLHHB58N3mtF".to_owned()),
+                    userId: None,
+                    teamId: None,
+                    userIp: None,
+                    sessionId: None,
+                    metricGroup: None,
+                    data: None,
+                }),
+            };
+
+            let mut buf = Vec::new();
+            format_log_record(&record, "api_key", "api_key_id", &mut buf);
+
+            let expected = "<132>1 2021-03-18T13:12:27.000+00:00 localhost test 1234 4321 [api_key_id@53595 apiKey=\"api_key\" env=\"test\"] Hello, World! {\"recordingId\":\"evANFeLHHB58N3mtF\"}\n";
+            assert_eq!(String::from_utf8(buf).unwrap(), expected);
         }
     }
 }
