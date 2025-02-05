@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::{env, fmt, process};
 
 use backend::Backend;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rustls::pki_types::InvalidDnsNameError;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -132,7 +132,7 @@ impl Logger {
 
             severity: SyslogSeverity::Informational,
             msg_id: "".to_string(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             message: None,
             well_known: None,
         });
@@ -230,7 +230,7 @@ where
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut record = (*self.base_record).clone();
         let mut json = Map::with_capacity(16);
-        record.timestamp = Utc::now();
+        record.timestamp = Timestamp::now();
 
         let scope = ctx.event_scope(event);
 
@@ -353,7 +353,7 @@ struct LogRecord {
 
     severity: SyslogSeverity,
     msg_id: String,
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
     message: Option<String>,
     well_known: Option<WellKnown>,
 }
@@ -458,7 +458,7 @@ fn handle_log_record(r: LogRecord, backend: Option<&Backend>) {
     if !send_to_backend && should_log {
         let row_color = format!(
             "{} {}  {} {}",
-            r.timestamp.format("%H:%M:%S%.3f"),
+            r.timestamp.strftime("%H:%M:%S%.3f"),
             format!("{:5}", r.severity.to_string()).color(color).bold(),
             r.message.as_deref().unwrap_or(""),
             if let Some(wk) = &r.well_known {
