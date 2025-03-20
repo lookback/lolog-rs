@@ -59,7 +59,6 @@ pub struct NetworkConfig {
     port: u16,
     api_key: String,
     api_key_id: String,
-    use_tls: bool,
 }
 
 impl NetworkConfig {
@@ -69,9 +68,6 @@ impl NetworkConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(6514);
-        let use_tls = env::var("SYSLOG_TLS")
-            .map(|x| x == "1" || x == "true")
-            .unwrap_or(false);
         let api_key_id = env::var("SYSLOG_API_KEY_ID").unwrap_or_else(|_| "".into());
         let api_key = env::var("SYSLOG_API_KEY").unwrap_or_else(|_| "".into());
 
@@ -80,7 +76,6 @@ impl NetworkConfig {
             port,
             api_key,
             api_key_id,
-            use_tls,
         }
     }
 }
@@ -143,9 +138,7 @@ impl Logger {
                 port,
                 api_key_id,
                 api_key,
-                use_tls,
             })) => {
-                assert!(use_tls, "TLS must be used");
                 let id = if api_key_id.is_empty() {
                     config.app_name.clone()
                 } else {
